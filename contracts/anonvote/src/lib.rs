@@ -18,9 +18,7 @@
 
 #![no_std]
 
-use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, Env, String,
-};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String};
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
 
@@ -29,6 +27,8 @@ use soroban_sdk::{
 pub enum DataKey {
     /// Admin address — only admin can record events
     Admin,
+    /// Emergency pause flag — write operations are blocked while true
+    Paused,
     /// Token issued count for a ballot: ballot_id_hash → u32
     TokensIssued(String),
     /// Votes cast count for a ballot: ballot_id_hash → u32
@@ -53,6 +53,30 @@ impl AnonVoteContract {
             panic!("already initialized");
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::Paused, &false);
+    }
+
+    /// Pause all write operations in an emergency.
+    /// Read-only audit queries continue to work while paused.
+    pub fn pause_contract(env: Env, caller: Address) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+        env.storage().instance().set(&DataKey::Paused, &true);
+        env.events().publish(
+            (symbol_short!("contract"), symbol_short!("paused")),
+            (caller, env.ledger().timestamp()),
+        );
+    }
+
+    /// Resume write operations after an emergency pause.
+    pub fn resume_contract(env: Env, caller: Address) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+        env.storage().instance().set(&DataKey::Paused, &false);
+        env.events().publish(
+            (symbol_short!("contract"), symbol_short!("resumed")),
+            (caller, env.ledger().timestamp()),
+        );
     }
 
     /// Record a ballot creation event.
@@ -60,6 +84,7 @@ impl AnonVoteContract {
     pub fn record_ballot(env: Env, caller: Address, ballot_id_hash: String) {
         caller.require_auth();
         Self::require_admin(&env, &caller);
+        Self::require_not_paused(&env);
 
         let key = DataKey::BallotExists(ballot_id_hash.clone());
         if env.storage().persistent().has(&key) {
@@ -82,6 +107,7 @@ impl AnonVoteContract {
     pub fn record_token(env: Env, caller: Address, ballot_id_hash: String) {
         caller.require_auth();
         Self::require_admin(&env, &caller);
+        Self::require_not_paused(&env);
         Self::require_ballot_exists(&env, &ballot_id_hash);
 
         let key = DataKey::TokensIssued(ballot_id_hash);
@@ -97,6 +123,7 @@ impl AnonVoteContract {
     pub fn record_vote(env: Env, caller: Address, ballot_id_hash: String) {
         caller.require_auth();
         Self::require_admin(&env, &caller);
+        Self::require_not_paused(&env);
         Self::require_ballot_exists(&env, &ballot_id_hash);
 
         let key = DataKey::VotesCast(ballot_id_hash);
@@ -109,14 +136,10 @@ impl AnonVoteContract {
 
     /// Record the result publication for a ballot.
     /// result_hash: SHA-256 hex of the tally JSON
-    pub fn record_result(
-        env: Env,
-        caller: Address,
-        ballot_id_hash: String,
-        result_hash: String,
-    ) {
+    pub fn record_result(env: Env, caller: Address, ballot_id_hash: String, result_hash: String) {
         caller.require_auth();
         Self::require_admin(&env, &caller);
+        Self::require_not_paused(&env);
         Self::require_ballot_exists(&env, &ballot_id_hash);
 
         let key = DataKey::ResultHash(ballot_id_hash);
@@ -161,6 +184,11 @@ impl AnonVoteContract {
             .has(&DataKey::BallotExists(ballot_id_hash))
     }
 
+    /// Check whether write operations are currently paused.
+    pub fn is_paused(env: Env) -> bool {
+        Self::paused(&env)
+    }
+
     /// Verify consistency: returns true if tokens_issued == votes_cast.
     pub fn is_consistent(env: Env, ballot_id_hash: String) -> bool {
         let tokens: u32 = env
@@ -177,6 +205,19 @@ impl AnonVoteContract {
     }
 
     // ── Internal helpers ─────────────────────────────────────────────────────
+
+    fn paused(env: &Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
+    fn require_not_paused(env: &Env) {
+        if Self::paused(env) {
+            panic!("contract paused");
+        }
+    }
 
     fn require_admin(env: &Env, caller: &Address) {
         let admin: Address = env
@@ -259,5 +300,54 @@ mod tests {
         let ballot_hash = String::from_str(&env, "abc123");
         let attacker = Address::generate(&env);
         client.record_ballot(&attacker, &ballot_hash);
+    }
+
+    #[test]
+    fn test_pause_and_resume_contract() {
+        let (env, client, admin) = setup();
+        let ballot_hash = String::from_str(&env, "paused-read-ballot");
+
+        assert!(!client.is_paused());
+        client.record_ballot(&admin, &ballot_hash);
+        client.pause_contract(&admin);
+
+        assert!(client.is_paused());
+        assert!(client.ballot_exists(&ballot_hash));
+        assert_eq!(client.get_tokens_issued(&ballot_hash), 0);
+
+        client.resume_contract(&admin);
+        assert!(!client.is_paused());
+
+        client.record_token(&admin, &ballot_hash);
+        assert_eq!(client.get_tokens_issued(&ballot_hash), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "contract paused")]
+    fn test_paused_contract_blocks_writes() {
+        let (env, client, admin) = setup();
+        let ballot_hash = String::from_str(&env, "paused-write-ballot");
+
+        client.pause_contract(&admin);
+        client.record_ballot(&admin, &ballot_hash);
+    }
+
+    #[test]
+    #[should_panic(expected = "unauthorized")]
+    fn test_only_admin_can_pause_contract() {
+        let (env, client, _admin) = setup();
+        let attacker = Address::generate(&env);
+
+        client.pause_contract(&attacker);
+    }
+
+    #[test]
+    #[should_panic(expected = "unauthorized")]
+    fn test_only_admin_can_resume_contract() {
+        let (env, client, admin) = setup();
+        let attacker = Address::generate(&env);
+
+        client.pause_contract(&admin);
+        client.resume_contract(&attacker);
     }
 }

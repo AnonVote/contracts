@@ -29,6 +29,8 @@ The primary Soroban contract. Records immutable audit events on-chain with publi
 | Function                                     | Description                                                          |
 | -------------------------------------------- | -------------------------------------------------------------------- |
 | `initialize(admin)`                          | One-time setup after deployment. Sets the admin address.             |
+| `pause_contract(caller)`                     | Pause write operations in an emergency.                              |
+| `resume_contract(caller)`                    | Resume write operations after an emergency pause.                    |
 | `record_ballot(ballot_id_hash)`              | Register a ballot on-chain. Input is SHA-256 hex of the ballot UUID. |
 | `record_token(ballot_id_hash)`               | Increment the token-issued count for a ballot.                       |
 | `record_vote(ballot_id_hash)`                | Increment the vote-cast count for a ballot.                          |
@@ -38,6 +40,7 @@ The primary Soroban contract. Records immutable audit events on-chain with publi
 | `get_result_hash(ballot_id_hash)`            | Read result hash (view call).                                        |
 | `ballot_exists(ballot_id_hash)`              | Check if a ballot has been recorded on-chain.                        |
 | `is_consistent(ballot_id_hash)`              | Returns `true` if `tokens_issued == votes_cast`.                     |
+| `is_paused()`                                | Returns whether write operations are paused.                         |
 
 **Privacy guarantees:**
 
