@@ -18,9 +18,7 @@
 
 #![no_std]
 
-use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, Env, String,
-};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String};
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
 
@@ -59,6 +57,7 @@ impl AnonVoteContract {
     /// ballot_id_hash: SHA-256 hex of the ballot UUID
     pub fn record_ballot(env: Env, caller: Address, ballot_id_hash: String) {
         caller.require_auth();
+        Self::verify_initialized(&env);
         Self::require_admin(&env, &caller);
 
         let key = DataKey::BallotExists(ballot_id_hash.clone());
@@ -81,6 +80,7 @@ impl AnonVoteContract {
     /// Called when a voter token is issued.
     pub fn record_token(env: Env, caller: Address, ballot_id_hash: String) {
         caller.require_auth();
+        Self::verify_initialized(&env);
         Self::require_admin(&env, &caller);
         Self::require_ballot_exists(&env, &ballot_id_hash);
 
@@ -96,6 +96,7 @@ impl AnonVoteContract {
     /// Called when a vote is submitted.
     pub fn record_vote(env: Env, caller: Address, ballot_id_hash: String) {
         caller.require_auth();
+        Self::verify_initialized(&env);
         Self::require_admin(&env, &caller);
         Self::require_ballot_exists(&env, &ballot_id_hash);
 
@@ -109,13 +110,9 @@ impl AnonVoteContract {
 
     /// Record the result publication for a ballot.
     /// result_hash: SHA-256 hex of the tally JSON
-    pub fn record_result(
-        env: Env,
-        caller: Address,
-        ballot_id_hash: String,
-        result_hash: String,
-    ) {
+    pub fn record_result(env: Env, caller: Address, ballot_id_hash: String, result_hash: String) {
         caller.require_auth();
+        Self::verify_initialized(&env);
         Self::require_admin(&env, &caller);
         Self::require_ballot_exists(&env, &ballot_id_hash);
 
@@ -178,6 +175,12 @@ impl AnonVoteContract {
 
     // ── Internal helpers ─────────────────────────────────────────────────────
 
+    fn verify_initialized(env: &Env) {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            panic!("not initialized");
+        }
+    }
+
     fn require_admin(env: &Env, caller: &Address) {
         let admin: Address = env
             .storage()
@@ -207,13 +210,18 @@ mod tests {
     use super::*;
     use soroban_sdk::{testutils::Address as _, Env, String};
 
-    fn setup() -> (Env, AnonVoteContractClient<'static>, Address) {
+    fn setup_with_contract_id() -> (Env, AnonVoteContractClient<'static>, Address, Address) {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register_contract(None, AnonVoteContract);
         let client = AnonVoteContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         client.initialize(&admin);
+        (env, client, admin, contract_id)
+    }
+
+    fn setup() -> (Env, AnonVoteContractClient<'static>, Address) {
+        let (env, client, admin, _contract_id) = setup_with_contract_id();
         (env, client, admin)
     }
 
@@ -259,5 +267,23 @@ mod tests {
         let ballot_hash = String::from_str(&env, "abc123");
         let attacker = Address::generate(&env);
         client.record_ballot(&attacker, &ballot_hash);
+    }
+
+    #[test]
+    fn test_verify_initialized_accepts_initialized_contract() {
+        let (env, _client, _admin, contract_id) = setup_with_contract_id();
+        env.as_contract(&contract_id, || {
+            AnonVoteContract::verify_initialized(&env);
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "not initialized")]
+    fn test_verify_initialized_rejects_uninitialized_contract() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, AnonVoteContract);
+        env.as_contract(&contract_id, || {
+            AnonVoteContract::verify_initialized(&env);
+        });
     }
 }
