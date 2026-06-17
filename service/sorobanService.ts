@@ -281,6 +281,35 @@ export async function sorobanRecordResult(
 }
 
 /**
+ * Pause all write operations on the deployed contract.
+ * Read-only audit queries remain available while paused.
+ */
+export async function sorobanPauseContract(
+  config: SorobanConfig,
+  callerAddress: string,
+): Promise<string> {
+  if (!config.contractId) return "";
+  const result = await invokeContract(config, "pause_contract", [
+    { value: callerAddress, type: "address" },
+  ]);
+  return result.txHash;
+}
+
+/**
+ * Resume write operations after a contract pause.
+ */
+export async function sorobanResumeContract(
+  config: SorobanConfig,
+  callerAddress: string,
+): Promise<string> {
+  if (!config.contractId) return "";
+  const result = await invokeContract(config, "resume_contract", [
+    { value: callerAddress, type: "address" },
+  ]);
+  return result.txHash;
+}
+
+/**
  * Read on-chain audit counts for a ballot (view call — no transaction).
  */
 export async function sorobanGetAuditCounts(
