@@ -28,14 +28,14 @@ use soroban_sdk::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum ContractError {
-    AdminUnauthorized     = 1,
-    AlreadyInitialized    = 2,
-    NotInitialized        = 3,
-    BallotNotFound        = 4,
-    BallotAlreadyExists   = 5,
+    AdminUnauthorized = 1,
+    AlreadyInitialized = 2,
+    NotInitialized = 3,
+    BallotNotFound = 4,
+    BallotAlreadyExists = 5,
     ResultAlreadyPublished = 6,
-    CounterOverflow       = 7,
-    InvalidBallotHash     = 8,
+    CounterOverflow = 7,
+    InvalidBallotHash = 8,
 }
 
 // ── Ballot state types ────────────────────────────────────────────────────────
@@ -248,8 +248,7 @@ impl AnonVoteContract {
         env.storage().persistent().set(&key, &result_hash.clone());
 
         let metadata_key = DataKey::BallotMetadata(ballot_id_hash.clone());
-        let mut metadata: BallotMetadata =
-            env.storage().persistent().get(&metadata_key).unwrap();
+        let mut metadata: BallotMetadata = env.storage().persistent().get(&metadata_key).unwrap();
         metadata.state = BallotState::ResultPublished;
         env.storage().persistent().set(&metadata_key, &metadata);
 
@@ -441,7 +440,7 @@ mod tests {
         let contract_id = env.register_contract(None, AnonVoteContract);
         let client = AnonVoteContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
-        client.initialize(&admin).unwrap();
+        client.initialize(&admin);
         (env, client, admin)
     }
 
@@ -451,7 +450,7 @@ mod tests {
         let contract_id = env.register_contract(None, AnonVoteContract);
         let client = AnonVoteContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
-        client.initialize(&admin).unwrap();
+        client.initialize(&admin);
         (env, contract_id, client, admin)
     }
 
@@ -461,7 +460,7 @@ mod tests {
     fn test_record_ballot_and_query() {
         let (env, client, admin) = setup();
         let ballot_hash = String::from_str(&env, "abc123");
-        client.record_ballot(&admin, &ballot_hash).unwrap();
+        client.record_ballot(&admin, &ballot_hash);
         assert!(client.ballot_exists(&ballot_hash));
         assert_eq!(client.get_tokens_issued(&ballot_hash), Some(0));
         assert_eq!(client.get_votes_cast(&ballot_hash), Some(0));
@@ -471,14 +470,14 @@ mod tests {
     fn test_token_and_vote_counts() {
         let (env, client, admin) = setup();
         let ballot_hash = String::from_str(&env, "abc123");
-        client.record_ballot(&admin, &ballot_hash).unwrap();
-        client.record_token(&admin, &ballot_hash).unwrap();
-        client.record_token(&admin, &ballot_hash).unwrap();
-        client.record_vote(&admin, &ballot_hash).unwrap();
+        client.record_ballot(&admin, &ballot_hash);
+        client.record_token(&admin, &ballot_hash);
+        client.record_token(&admin, &ballot_hash);
+        client.record_vote(&admin, &ballot_hash);
         assert_eq!(client.get_tokens_issued(&ballot_hash), Some(2));
         assert_eq!(client.get_votes_cast(&ballot_hash), Some(1));
         assert!(!client.is_consistent(&ballot_hash));
-        client.record_vote(&admin, &ballot_hash).unwrap();
+        client.record_vote(&admin, &ballot_hash);
         assert!(client.is_consistent(&ballot_hash));
     }
 
@@ -487,10 +486,8 @@ mod tests {
         let (env, client, admin) = setup();
         let ballot_hash = String::from_str(&env, "abc123");
         let result_hash = String::from_str(&env, "deadbeef");
-        client.record_ballot(&admin, &ballot_hash).unwrap();
-        client
-            .record_result(&admin, &ballot_hash, &result_hash)
-            .unwrap();
+        client.record_ballot(&admin, &ballot_hash);
+        client.record_result(&admin, &ballot_hash, &result_hash);
         assert_eq!(client.get_result_hash(&ballot_hash), Some(result_hash));
     }
 
@@ -498,12 +495,12 @@ mod tests {
     fn test_ballot_metadata() {
         let (env, client, admin) = setup();
         let ballot_hash = String::from_str(&env, "abc123");
-        client.record_ballot(&admin, &ballot_hash).unwrap();
+        client.record_ballot(&admin, &ballot_hash);
 
         let metadata = client.get_ballot_metadata(&ballot_hash).unwrap();
         assert_eq!(metadata.admin, admin);
         assert_eq!(metadata.state, BallotState::Active);
-        assert!(metadata.created_at > 0);
+        assert_eq!(metadata.created_at, env.ledger().timestamp());
     }
 
     #[test]
@@ -512,13 +509,11 @@ mod tests {
         let ballot_hash = String::from_str(&env, "abc123");
         let result_hash = String::from_str(&env, "deadbeef");
 
-        client.record_ballot(&admin, &ballot_hash).unwrap();
-        client.record_token(&admin, &ballot_hash).unwrap();
-        client.record_token(&admin, &ballot_hash).unwrap();
-        client.record_vote(&admin, &ballot_hash).unwrap();
-        client
-            .record_result(&admin, &ballot_hash, &result_hash)
-            .unwrap();
+        client.record_ballot(&admin, &ballot_hash);
+        client.record_token(&admin, &ballot_hash);
+        client.record_token(&admin, &ballot_hash);
+        client.record_vote(&admin, &ballot_hash);
+        client.record_result(&admin, &ballot_hash, &result_hash);
 
         let state = client.get_ballot_state(&ballot_hash).unwrap();
         assert_eq!(state.tokens_issued, 2);
@@ -534,8 +529,8 @@ mod tests {
         let ballot_hash = String::from_str(&env, "nonexistent");
         assert_eq!(client.get_tokens_issued(&ballot_hash), None);
         assert_eq!(client.get_votes_cast(&ballot_hash), None);
-        assert_eq!(client.get_ballot_metadata(&ballot_hash), None);
-        assert_eq!(client.get_ballot_state(&ballot_hash), None);
+        assert!(client.get_ballot_metadata(&ballot_hash).is_none());
+        assert!(client.get_ballot_state(&ballot_hash).is_none());
     }
 
     // ── Error-case tests ─────────────────────────────────────────────────────
@@ -551,7 +546,6 @@ mod tests {
     fn test_initialization_timestamp_stored() {
         let (_, client, _) = setup();
         assert!(client.get_initialized_at().is_some());
-        assert!(client.get_initialized_at().unwrap() > 0);
     }
 
     #[test]
@@ -570,20 +564,20 @@ mod tests {
     fn test_record_ballot_idempotent_same_admin() {
         let (env, client, admin) = setup();
         let ballot_hash = String::from_str(&env, "abc123");
-        client.record_ballot(&admin, &ballot_hash).unwrap();
+        client.record_ballot(&admin, &ballot_hash);
         // Second call with same admin → idempotent success
-        client.record_ballot(&admin, &ballot_hash).unwrap();
+        client.record_ballot(&admin, &ballot_hash);
     }
 
     #[test]
     fn test_record_ballot_different_admin_returns_already_exists() {
         let (env, client, admin) = setup();
         let ballot_hash = String::from_str(&env, "abc123");
-        client.record_ballot(&admin, &ballot_hash).unwrap();
+        client.record_ballot(&admin, &ballot_hash);
 
         // Rotate admin so we have a different valid admin
         let new_admin = Address::generate(&env);
-        client.rotate_admin(&admin, &new_admin).unwrap();
+        client.rotate_admin(&admin, &new_admin);
 
         let err = client
             .try_record_ballot(&new_admin, &ballot_hash)
@@ -596,7 +590,7 @@ mod tests {
     fn test_counter_overflow_token() {
         let (env, contract_id, client, admin) = setup_with_id();
         let ballot_hash = String::from_str(&env, "abc123");
-        client.record_ballot(&admin, &ballot_hash).unwrap();
+        client.record_ballot(&admin, &ballot_hash);
 
         // Force counter to u32::MAX inside the contract's storage context
         let bh = ballot_hash.clone();
@@ -617,7 +611,7 @@ mod tests {
     fn test_counter_overflow_vote() {
         let (env, contract_id, client, admin) = setup_with_id();
         let ballot_hash = String::from_str(&env, "abc123");
-        client.record_ballot(&admin, &ballot_hash).unwrap();
+        client.record_ballot(&admin, &ballot_hash);
 
         let bh = ballot_hash.clone();
         env.as_contract(&contract_id, || {
@@ -638,14 +632,10 @@ mod tests {
         let (env, client, admin) = setup();
         let ballot_hash = String::from_str(&env, "abc123");
         let result_hash = String::from_str(&env, "deadbeef");
-        client.record_ballot(&admin, &ballot_hash).unwrap();
-        client
-            .record_result(&admin, &ballot_hash, &result_hash)
-            .unwrap();
+        client.record_ballot(&admin, &ballot_hash);
+        client.record_result(&admin, &ballot_hash, &result_hash);
         // Same hash again → idempotent success
-        client
-            .record_result(&admin, &ballot_hash, &result_hash)
-            .unwrap();
+        client.record_result(&admin, &ballot_hash, &result_hash);
     }
 
     #[test]
@@ -654,10 +644,8 @@ mod tests {
         let ballot_hash = String::from_str(&env, "abc123");
         let result_hash = String::from_str(&env, "deadbeef");
         let other_hash = String::from_str(&env, "cafebabe");
-        client.record_ballot(&admin, &ballot_hash).unwrap();
-        client
-            .record_result(&admin, &ballot_hash, &result_hash)
-            .unwrap();
+        client.record_ballot(&admin, &ballot_hash);
+        client.record_result(&admin, &ballot_hash, &result_hash);
 
         let err = client
             .try_record_result(&admin, &ballot_hash, &other_hash)
@@ -671,11 +659,9 @@ mod tests {
         let (env, client, admin) = setup();
         let ballot_hash = String::from_str(&env, "abc123");
         let result_hash = String::from_str(&env, "deadbeef");
-        client.record_ballot(&admin, &ballot_hash).unwrap();
+        client.record_ballot(&admin, &ballot_hash);
         assert!(!client.result_exists(&ballot_hash));
-        client
-            .record_result(&admin, &ballot_hash, &result_hash)
-            .unwrap();
+        client.record_result(&admin, &ballot_hash, &result_hash);
         assert!(client.result_exists(&ballot_hash));
     }
 
@@ -683,7 +669,7 @@ mod tests {
     fn test_rotate_admin() {
         let (env, client, admin) = setup();
         let new_admin = Address::generate(&env);
-        client.rotate_admin(&admin, &new_admin).unwrap();
+        client.rotate_admin(&admin, &new_admin);
 
         // Old admin can no longer record
         let ballot_hash = String::from_str(&env, "abc123");
@@ -694,7 +680,7 @@ mod tests {
         assert_eq!(err, ContractError::AdminUnauthorized);
 
         // New admin can record
-        client.record_ballot(&new_admin, &ballot_hash).unwrap();
+        client.record_ballot(&new_admin, &ballot_hash);
     }
 
     #[test]
