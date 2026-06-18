@@ -63,6 +63,7 @@ export interface SorobanConfig {
   stellarSecretKey: string;
   stellarNetwork: "testnet" | "mainnet";
   contractId: string;
+  rpcServer?: Pick<StellarSdk.SorobanRpc.Server, "getEvents"> | undefined;
 }
 
 export enum BallotState {
@@ -85,6 +86,40 @@ export interface SorobanInvokeResult {
   returnValue?: unknown;
   errorCode?: SorobanErrorCode;
   errorMessage?: string;
+}
+
+export type SorobanAuditEventType =
+  | "ballot_created"
+  | "token_issued"
+  | "vote_cast"
+  | "result_published"
+  | "counter_overflow"
+  | "admin_rotated";
+
+export interface SorobanEventFilter {
+  eventType?: SorobanAuditEventType | string;
+  ballotIdHash?: string;
+  startTime?: number;
+  endTime?: number;
+}
+
+export interface SorobanEventData {
+  id: string;
+  pagingToken?: string | undefined;
+  ledger: number;
+  ledgerClosedAt?: string | undefined;
+  timestamp?: number | undefined;
+  contractId?: string | undefined;
+  eventType: SorobanAuditEventType | string;
+  ballotIdHash?: string | undefined;
+  count?: number | undefined;
+  createdAt?: number | undefined;
+  admin?: string | undefined;
+  previousAdmin?: string | undefined;
+  newAdmin?: string | undefined;
+  resultHash?: string | undefined;
+  topics: unknown[];
+  value: unknown;
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
@@ -121,6 +156,162 @@ function parseContractErrorCode(errorText: string): SorobanErrorCode | undefined
     if (code in SorobanErrorCode) return code as SorobanErrorCode;
   }
   return undefined;
+}
+
+const EVENT_SYMBOL_TO_TYPE: Record<string, SorobanAuditEventType> = {
+  blt_crtd: "ballot_created",
+  ballot_created: "ballot_created",
+  tok_issd: "token_issued",
+  token_issued: "token_issued",
+  vote_cast: "vote_cast",
+  res_pub: "result_published",
+  result_published: "result_published",
+  cnt_ovflw: "counter_overflow",
+  counter_overflow: "counter_overflow",
+  adm_rotd: "admin_rotated",
+  admin_rotated: "admin_rotated",
+};
+
+const EVENT_TYPE_TO_SYMBOL: Record<SorobanAuditEventType, string> = {
+  ballot_created: "blt_crtd",
+  token_issued: "tok_issd",
+  vote_cast: "vote_cast",
+  result_published: "res_pub",
+  counter_overflow: "cnt_ovflw",
+  admin_rotated: "adm_rotd",
+};
+
+const SOROBAN_EVENT_PAGE_LIMIT = 100;
+const SOROBAN_EVENT_MAX_PAGES = 25;
+
+function normalizeEventType(eventType: unknown): SorobanAuditEventType | string {
+  const key = String(eventType ?? "").trim();
+  return EVENT_SYMBOL_TO_TYPE[key] ?? key;
+}
+
+function parseLedgerClosedAt(ledgerClosedAt: unknown): number | undefined {
+  if (!ledgerClosedAt) return undefined;
+  const parsed = Date.parse(String(ledgerClosedAt));
+  return Number.isNaN(parsed) ? undefined : Math.floor(parsed / 1000);
+}
+
+function normalizeTimeFilter(timestamp: number): number {
+  return timestamp > 9999999999 ? Math.floor(timestamp / 1000) : timestamp;
+}
+
+function scValToNativeSafe(value: unknown): unknown {
+  if (!value) return value;
+  try {
+    return StellarSdk.scValToNative(value as any);
+  } catch {
+    return value;
+  }
+}
+
+function getEventTopics(event: any): unknown[] {
+  const topics = event.topic ?? event.topics ?? [];
+  return Array.isArray(topics) ? topics.map(scValToNativeSafe) : [];
+}
+
+function getEventValue(event: any): unknown {
+  return scValToNativeSafe(event.value);
+}
+
+function getEventTypeFromTopics(topics: unknown[]): SorobanAuditEventType | string {
+  const eventTopic = topics.find((topic) => {
+    const value = String(topic ?? "");
+    return value !== "audit" && EVENT_SYMBOL_TO_TYPE[value] !== undefined;
+  });
+  return normalizeEventType(eventTopic ?? "");
+}
+
+function getTupleValue(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [value];
+}
+
+export function parseSorobanEvent(event: unknown): SorobanEventData {
+  const raw = event as any;
+  const topics = getEventTopics(raw);
+  const value = getEventValue(raw);
+  const tuple = getTupleValue(value);
+  const eventType = getEventTypeFromTopics(topics);
+  const timestamp = parseLedgerClosedAt(raw.ledgerClosedAt);
+
+  const parsed: SorobanEventData = {
+    id: String(raw.id ?? raw.pagingToken ?? `${raw.ledger ?? ""}:${topics.join(":")}`),
+    pagingToken: raw.pagingToken,
+    ledger: Number(raw.ledger ?? 0),
+    ledgerClosedAt: raw.ledgerClosedAt,
+    timestamp,
+    contractId: raw.contractId,
+    eventType,
+    topics,
+    value,
+  };
+
+  switch (eventType) {
+    case "ballot_created":
+      parsed.ballotIdHash = String(tuple[0] ?? "");
+      parsed.createdAt = Number(tuple[1] ?? 0);
+      parsed.admin = tuple[2] !== undefined ? String(tuple[2]) : undefined;
+      break;
+    case "token_issued":
+    case "vote_cast":
+      parsed.ballotIdHash = String(tuple[0] ?? "");
+      parsed.count = Number(tuple[1] ?? 0);
+      break;
+    case "result_published":
+      parsed.ballotIdHash = String(tuple[0] ?? "");
+      parsed.resultHash = String(tuple[1] ?? "");
+      break;
+    case "counter_overflow":
+      parsed.ballotIdHash = String(tuple[0] ?? "");
+      break;
+    case "admin_rotated":
+      parsed.previousAdmin = tuple[0] !== undefined ? String(tuple[0]) : undefined;
+      parsed.newAdmin = tuple[1] !== undefined ? String(tuple[1]) : undefined;
+      break;
+  }
+
+  return parsed;
+}
+
+function matchesEventFilter(event: SorobanEventData, filter: SorobanEventFilter): boolean {
+  if (filter.eventType && event.eventType !== normalizeEventType(filter.eventType)) {
+    return false;
+  }
+  if (filter.ballotIdHash && event.ballotIdHash !== filter.ballotIdHash) {
+    return false;
+  }
+  if (
+    filter.startTime !== undefined &&
+    event.timestamp !== undefined &&
+    event.timestamp < normalizeTimeFilter(filter.startTime)
+  ) {
+    return false;
+  }
+  if (
+    filter.endTime !== undefined &&
+    event.timestamp !== undefined &&
+    event.timestamp > normalizeTimeFilter(filter.endTime)
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function buildTopicFilter(eventType?: string): string[][] | undefined {
+  if (!eventType) return undefined;
+  const normalized = normalizeEventType(eventType);
+  const symbol = EVENT_TYPE_TO_SYMBOL[normalized as SorobanAuditEventType] ?? eventType;
+
+  try {
+    const auditTopic = StellarSdk.nativeToScVal("audit", { type: "symbol" as any }).toXDR("base64");
+    const eventTopic = StellarSdk.nativeToScVal(symbol, { type: "symbol" as any }).toXDR("base64");
+    return [[auditTopic], [eventTopic]];
+  } catch {
+    return undefined;
+  }
 }
 
 // ── Core invoke / read ────────────────────────────────────────────────────────
@@ -272,6 +463,67 @@ export async function readContract(
   } catch (err) {
     console.error(`[Soroban] ${method} read error:`, err);
     return { value: null, ...makeError(SorobanErrorCode.NetworkError) };
+  }
+}
+
+/**
+ * Query Soroban RPC contract events and return structured audit events.
+ *
+ * RPC is narrowed to this contract and, when possible, the requested audit
+ * event topic. Ballot and time range filters are then applied client-side so
+ * callers can combine filters without manual iteration.
+ */
+export async function sorobanFilterEvents(
+  config: SorobanConfig,
+  filter: SorobanEventFilter = {},
+): Promise<SorobanEventData[]> {
+  if (!config.contractId) {
+    console.warn("[Soroban] sorobanFilterEvents: no contract ID, skipping event query");
+    return [];
+  }
+
+  try {
+    const server = config.rpcServer ?? getRpcServer(config.stellarNetwork);
+    const events: SorobanEventData[] = [];
+    let cursor: string | undefined;
+    let pages = 0;
+
+    do {
+      const eventFilter: any = {
+        type: "contract",
+        contractIds: [config.contractId],
+      };
+      const topics = buildTopicFilter(filter.eventType);
+      if (topics) eventFilter.topics = topics;
+
+      const response = await (server as any).getEvents({
+        startLedger: cursor ? undefined : 0,
+        filters: [eventFilter],
+        pagination: {
+          cursor,
+          limit: SOROBAN_EVENT_PAGE_LIMIT,
+        },
+      });
+
+      const pageEvents = Array.isArray(response.events) ? response.events : [];
+      for (const rawEvent of pageEvents) {
+        const parsed = parseSorobanEvent(rawEvent);
+        if (matchesEventFilter(parsed, filter)) {
+          events.push(parsed);
+        }
+      }
+
+      const lastEvent = pageEvents[pageEvents.length - 1];
+      const nextCursor = response.cursor
+        ?? (pageEvents.length === SOROBAN_EVENT_PAGE_LIMIT ? lastEvent?.pagingToken : undefined);
+      cursor = nextCursor && nextCursor !== cursor ? nextCursor : undefined;
+      pages++;
+    } while (cursor && pages < SOROBAN_EVENT_MAX_PAGES);
+
+    return events;
+  } catch (err) {
+    console.error("[Soroban] sorobanFilterEvents query failed:", err);
+    return [];
   }
 }
 
