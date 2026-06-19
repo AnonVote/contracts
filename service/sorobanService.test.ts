@@ -20,8 +20,8 @@ import {
   readContract,
   validateSorobanConfig,
   validateContractId,
-  sorobanTransitionBallotState,
-  BallotState,
+  sorobanRecordResult,
+  sorobanResultExists,
   SorobanErrorCode,
   DEFAULT_RETRY_POLICY,
   type SorobanConfig,
@@ -194,54 +194,68 @@ describe("invokeContract — exponential backoff polling", () => {
   });
 });
 
-describe("sorobanTransitionBallotState — state transition guard", () => {
-  it("returns success and a txHash for a valid transition", async () => {
-    mockRpc.simulateTransaction.mockResolvedValueOnce(simulationSuccess());
-    mockRpc.sendTransaction.mockResolvedValueOnce({ status: "PENDING", hash: "tx-transition" });
-    mockRpc.getTransaction.mockResolvedValueOnce(txSuccess());
+describe("sorobanRecordResult — finality guard / idempotency", () => {
+  it("returns success (no new tx) when ResultAlreadyPublished and on-chain hash matches", async () => {
+    // record_result simulation returns ResultAlreadyPublished
+    mockRpc.simulateTransaction
+      .mockResolvedValueOnce(simulationError("Error(Contract, #6)"))
+      // readContract for get_result_hash returns the same hash
+      .mockResolvedValueOnce(simulationSuccess("result-hash-abc"));
 
-    const result = await sorobanTransitionBallotState(
-      makeConfig(),
-      "ballot-a",
-      BallotState.ResultPublished,
-    );
+    const result = await sorobanRecordResult(makeConfig(), "ballot-x", "result-hash-abc");
     expect(result.success).toBe(true);
-    expect(result.txHash).toBe("tx-transition");
-  });
-
-  it("returns InvalidStateTransition when the contract rejects the transition", async () => {
-    mockRpc.simulateTransaction.mockResolvedValueOnce(simulationError("Error(Contract, #12)"));
-
-    const result = await sorobanTransitionBallotState(
-      makeConfig(),
-      "ballot-b",
-      BallotState.Archived,
-    );
-    expect(result.success).toBe(false);
-    expect(result.errorCode).toBe(SorobanErrorCode.InvalidStateTransition);
+    // No new transaction was sent; txHash is blank
+    expect(result.txHash).toBe("");
     expect(mockRpc.sendTransaction).not.toHaveBeenCalled();
   });
 
-  it("returns BallotNotFound when the ballot does not exist", async () => {
+  it("returns ResultAlreadyPublished error when the on-chain hash differs (conflict)", async () => {
+    // record_result simulation returns ResultAlreadyPublished
+    mockRpc.simulateTransaction
+      .mockResolvedValueOnce(simulationError("Error(Contract, #6)"))
+      // readContract for get_result_hash returns a DIFFERENT hash
+      .mockResolvedValueOnce(simulationSuccess("result-hash-DIFFERENT"));
+
+    const result = await sorobanRecordResult(makeConfig(), "ballot-y", "result-hash-mine");
+    expect(result.success).toBe(false);
+    expect(result.errorCode).toBe(SorobanErrorCode.ResultAlreadyPublished);
+    expect(mockRpc.sendTransaction).not.toHaveBeenCalled();
+  });
+
+  it("propagates non-finality errors (e.g. BallotNotFound) unchanged", async () => {
     mockRpc.simulateTransaction.mockResolvedValueOnce(simulationError("Error(Contract, #4)"));
 
-    const result = await sorobanTransitionBallotState(
-      makeConfig(),
-      "never-created",
-      BallotState.ResultPublished,
-    );
+    const result = await sorobanRecordResult(makeConfig(), "missing-ballot", "hash");
     expect(result.success).toBe(false);
     expect(result.errorCode).toBe(SorobanErrorCode.BallotNotFound);
   });
+});
 
-  it("returns NotConfigured without calling RPC when config is invalid", async () => {
-    const result = await sorobanTransitionBallotState(
-      makeConfig({ stellarSecretKey: "bad-key" }),
+describe("sorobanResultExists — finality pre-check query", () => {
+  it("returns false when no result has been published", async () => {
+    mockRpc.simulateTransaction.mockResolvedValueOnce(simulationSuccess(false));
+    const result = await sorobanResultExists(makeConfig(), "ballot-a");
+    expect(result).toBe(false);
+  });
+
+  it("returns true when a result has already been published", async () => {
+    mockRpc.simulateTransaction.mockResolvedValueOnce(simulationSuccess(true));
+    const result = await sorobanResultExists(makeConfig(), "ballot-b");
+    expect(result).toBe(true);
+  });
+
+  it("returns null when the contract ID is invalid without throwing", async () => {
+    const result = await sorobanResultExists(
+      makeConfig({ contractId: "not-a-contract" }),
       "ballot-c",
-      BallotState.Archived,
     );
-    expect(result.success).toBe(false);
-    expect(result.errorCode).toBe(SorobanErrorCode.NotConfigured);
+    expect(result).toBeNull();
     expect(mockRpc.simulateTransaction).not.toHaveBeenCalled();
+  });
+
+  it("returns null when the RPC call itself fails", async () => {
+    mockRpc.simulateTransaction.mockResolvedValueOnce(simulationError("Error(Contract, #3)"));
+    const result = await sorobanResultExists(makeConfig(), "ballot-d");
+    expect(result).toBeNull();
   });
 });
