@@ -90,6 +90,7 @@ pub struct PendingUpgrade {
 pub enum BallotState {
     Active,
     ResultPublished,
+    Archived,
 }
 
 #[contracttype]
@@ -110,6 +111,7 @@ pub struct BallotStateSnapshot {
     pub created_at: u64,
     pub admin: Address,
     pub state: BallotState,
+    pub state_updated_at: u64,
 }
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
@@ -330,6 +332,7 @@ impl AnonVoteContract {
         let mut metadata: BallotMetadata =
             env.storage().persistent().get(&metadata_key).unwrap();
         metadata.state = BallotState::ResultPublished;
+        metadata.state_updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&metadata_key, &metadata);
 
         env.events().publish(
@@ -632,6 +635,7 @@ impl AnonVoteContract {
             created_at: metadata.created_at,
             admin: metadata.admin,
             state: metadata.state,
+            state_updated_at: metadata.state_updated_at,
         })
     }
 
