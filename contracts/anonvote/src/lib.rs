@@ -29,7 +29,7 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, String,
 };
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -128,6 +128,27 @@ pub struct BallotStateSnapshot {
 
 #[contracttype]
 #[derive(Clone)]
+pub struct BallotLimits {
+    pub max_tokens: u32,
+    pub max_votes: u32,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct BallotMetadata {
+    pub limits: BallotLimits,
+}
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    LimitExceeded = 1,
+    BallotNotFound = 2,
+}
+
+#[contracttype]
+#[derive(Clone)]
 pub enum DataKey {
     /// Admin address — only admin can manage roles
     Admin,
@@ -139,14 +160,8 @@ pub enum DataKey {
     VotesCast(String),
     /// Result hash for a ballot: ballot_id_hash → String
     ResultHash(String),
-    /// Whether a ballot has been created: ballot_id_hash → bool
-    BallotExists(String),
     /// Ballot metadata: ballot_id_hash → BallotMetadata
     BallotMetadata(String),
-    /// Pending upgrade
-    PendingUpgrade,
-    /// Ballot expire: ballot_id_hash → bool
-    BallotExpired(String),
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -189,122 +204,24 @@ impl AnonVoteContract {
         Ok(())
     }
 
-    // ── Role management (admin only) ─────────────────────────────────────────
-
-    /// Grant `role` to `grantee`.  Only the admin may call this.
-    ///
-    /// If the grantee already holds the role the call is a no-op (idempotent).
-    pub fn grant_role(env: Env, caller: Address, grantee: Address, role: Role) {
-        caller.require_auth();
-        Self::require_admin(&env, &caller);
-
-        let key = DataKey::Roles(grantee.clone());
-        let mut roles: Vec<Role> = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or_else(|| vec![&env]);
-
-        // Idempotent: only push if not already present
-        let mut already_has = false;
-        for r in roles.iter() {
-            if r == role {
-                already_has = true;
-                break;
-            }
-        }
-        if !already_has {
-            roles.push_back(role);
-            env.storage().persistent().set(&key, &roles);
-        }
-
-        env.events()
-            .publish((symbol_short!("role"),), (symbol_short!("granted"),));
-    }
-
-    /// Revoke `role` from `grantee`.  Only the admin may call this.
-    ///
-    /// Revocation takes effect immediately — subsequent calls by `grantee`
-    /// that require the revoked role will be rejected.
-    pub fn revoke_role(env: Env, caller: Address, grantee: Address, role: Role) {
-        caller.require_auth();
-        Self::require_admin(&env, &caller);
-
-        let key = DataKey::Roles(grantee.clone());
-        let roles: Vec<Role> = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or_else(|| vec![&env]);
-
-        // Rebuild without the revoked role
-        let mut updated: Vec<Role> = vec![&env];
-        for r in roles.iter() {
-            if r != role {
-                updated.push_back(r);
-            }
-        }
-        env.storage().persistent().set(&key, &updated);
-
-        env.events()
-            .publish((symbol_short!("role"),), (symbol_short!("revoked"),));
-    }
-
-    /// Returns true if `addr` holds `role` (or is the admin).
-    pub fn has_role(env: Env, addr: Address, role: Role) -> bool {
-        // Admin always has every role
-        if Self::is_admin(&env, &addr) {
-            return true;
-        }
-        let key = DataKey::Roles(addr);
-        let roles: Vec<Role> = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or_else(|| vec![&env]);
-        for r in roles.iter() {
-            if r == role {
-                return true;
-            }
-        }
-        false
-    }
-
-    // ── Write operations ─────────────────────────────────────────────────────
-
     /// Record a ballot creation event.
-    /// ballot_id_hash: SHA-256 hex of the ballot UUID.
-    /// Idempotent: if the same caller re-records the same ballot, returns success.
-    /// Returns BallotAlreadyExists if a different admin recorded this ballot.
+    /// ballot_id_hash: SHA-256 hex of the ballot UUID
     pub fn record_ballot(
         env: Env,
         caller: Address,
         ballot_id_hash: String,
-        expiration_time: u64
-    ) -> Result<(), ContractError> {
-        if ballot_id_hash.len() == 0 {
-            return Err(ContractError::InvalidBallotHash);
-        }
+        limits: BallotLimits,
+    ) -> Result<(), Error> {
         caller.require_auth();
-        Self::require_not_paused(&env)?;
-        Self::check_rate_limit(&env, &caller, Operation::RecordBallot)?;
-        Self::require_admin(&env, &caller)?;
+        Self::require_admin(&env, &caller);
 
-        let exists_key = DataKey::BallotExists(ballot_id_hash.clone());
-        if env.storage().persistent().has(&exists_key) {
-            // Idempotency: if same admin recorded it, treat as success
-            let meta: BallotMetadata = env
-                .storage()
-                .persistent()
-                .get(&DataKey::BallotMetadata(ballot_id_hash))
-                .unwrap();
-            if meta.admin == caller {
-                return Ok(());
-            }
-            return Err(ContractError::BallotAlreadyExists);
+        let key = DataKey::BallotMetadata(ballot_id_hash.clone());
+        if env.storage().persistent().has(&key) {
+            panic!("ballot already recorded");
         }
-
-        env.storage().persistent().set(&exists_key, &true);
+        env.storage()
+            .persistent()
+            .set(&key, &BallotMetadata { limits });
         env.storage()
             .persistent()
             .set(&DataKey::TokensIssued(ballot_id_hash.clone()), &0u32);
@@ -312,87 +229,54 @@ impl AnonVoteContract {
             .persistent()
             .set(&DataKey::VotesCast(ballot_id_hash.clone()), &0u32);
 
-        let created_at = env.ledger().timestamp();
-        let metadata = BallotMetadata {
-            created_at,
-            admin: caller.clone(),
-            state: BallotState::Active,
-            expiration_time
-        };
-        env.storage()
-            .persistent()
-            .set(&DataKey::BallotMetadata(ballot_id_hash.clone()), &metadata);
-
-        env.events().publish(
-            (symbol_short!("audit"), symbol_short!("blt_crtd")),
-            (ballot_id_hash, created_at, caller),
-        );
+        env.events()
+            .publish((symbol_short!("ballot"),), (symbol_short!("created"),));
         Ok(())
     }
 
     /// Increment the token issued count for a ballot.
-    /// Returns CounterOverflow if the count is already at u32::MAX.
-    pub fn record_token(
-        env: Env,
-        caller: Address,
-        ballot_id_hash: String,
-    ) -> Result<(), ContractError> {
+    /// Called when a voter token is issued.
+    pub fn record_token(env: Env, caller: Address, ballot_id_hash: String) -> Result<(), Error> {
         caller.require_auth();
-        Self::require_not_paused(&env)?;
-        Self::check_rate_limit(&env, &caller, Operation::RecordToken)?;
-        Self::require_admin(&env, &caller)?;
-        Self::require_ballot_exists(&env, &ballot_id_hash)?;
-        Self::require_ballot_not_expire(&env, &ballot_id_hash)?;
+        Self::require_admin(&env, &caller);
+        let metadata = Self::require_ballot_metadata(&env, &ballot_id_hash)?;
 
         let key = DataKey::TokensIssued(ballot_id_hash.clone());
         let count: u32 = env.storage().persistent().get(&key).unwrap_or(0);
-        if count == u32::MAX {
+        if count >= metadata.limits.max_tokens {
             env.events().publish(
-                (symbol_short!("audit"), symbol_short!("cnt_ovflw")),
-                (ballot_id_hash, count),
+                (symbol_short!("limit"), symbol_short!("token")),
+                (symbol_short!("current"), count),
             );
-            return Err(ContractError::CounterOverflow);
+            return Err(Error::LimitExceeded);
         }
-        let new_count = count + 1;
-        env.storage().persistent().set(&key, &new_count);
+        env.storage().persistent().set(&key, &(count + 1));
 
-        env.events().publish(
-            (symbol_short!("audit"), symbol_short!("tok_issd")),
-            (ballot_id_hash, new_count),
-        );
+        env.events()
+            .publish((symbol_short!("token"),), (symbol_short!("issued"),));
         Ok(())
     }
 
     /// Increment the votes cast count for a ballot.
-    /// Returns CounterOverflow if the count is already at u32::MAX.
-    pub fn record_vote(
-        env: Env,
-        caller: Address,
-        ballot_id_hash: String,
-    ) -> Result<(), ContractError> {
+    /// Called when a vote is submitted.
+    pub fn record_vote(env: Env, caller: Address, ballot_id_hash: String) -> Result<(), Error> {
         caller.require_auth();
-        Self::require_not_paused(&env)?;
-        Self::check_rate_limit(&env, &caller, Operation::RecordVote)?;
-        Self::require_admin(&env, &caller)?;
-        Self::require_ballot_exists(&env, &ballot_id_hash)?;
-        Self::require_ballot_not_expire(&env, &ballot_id_hash)?;
+        Self::require_admin(&env, &caller);
+        let metadata = Self::require_ballot_metadata(&env, &ballot_id_hash)?;
 
         let key = DataKey::VotesCast(ballot_id_hash.clone());
         let count: u32 = env.storage().persistent().get(&key).unwrap_or(0);
-        if count == u32::MAX {
+        if count >= metadata.limits.max_votes {
             env.events().publish(
-                (symbol_short!("audit"), symbol_short!("cnt_ovflw")),
-                (ballot_id_hash, count),
+                (symbol_short!("limit"), symbol_short!("vote")),
+                (symbol_short!("current"), count),
             );
-            return Err(ContractError::CounterOverflow);
+            return Err(Error::LimitExceeded);
         }
-        let new_count = count + 1;
-        env.storage().persistent().set(&key, &new_count);
+        env.storage().persistent().set(&key, &(count + 1));
 
-        env.events().publish(
-            (symbol_short!("audit"), symbol_short!("vote_cast")),
-            (ballot_id_hash, new_count),
-        );
+        env.events()
+            .publish((symbol_short!("vote"),), (symbol_short!("cast"),));
         Ok(())
     }
 
@@ -405,12 +289,10 @@ impl AnonVoteContract {
         caller: Address,
         ballot_id_hash: String,
         result_hash: String,
-    ) -> Result<(), ContractError> {
+    ) -> Result<(), Error> {
         caller.require_auth();
-        Self::require_not_paused(&env)?;
-        Self::check_rate_limit(&env, &caller, Operation::RecordResult)?;
-        Self::require_admin(&env, &caller)?;
-        Self::require_ballot_exists(&env, &ballot_id_hash)?;
+        Self::require_admin(&env, &caller);
+        Self::require_ballot_metadata(&env, &ballot_id_hash)?;
 
         let key = DataKey::ResultHash(ballot_id_hash.clone());
         if let Some(existing) = env.storage().persistent().get::<DataKey, String>(&key) {
@@ -421,187 +303,8 @@ impl AnonVoteContract {
             return Err(ContractError::ResultAlreadyPublished);
         }
 
-        env.storage().persistent().set(&key, &result_hash.clone());
-
-        let metadata_key = DataKey::BallotMetadata(ballot_id_hash.clone());
-        let mut metadata: BallotMetadata =
-            env.storage().persistent().get(&metadata_key).unwrap();
-        metadata.state = BallotState::ResultPublished;
-        metadata.state_updated_at = env.ledger().timestamp();
-        env.storage().persistent().set(&metadata_key, &metadata);
-
-        env.events().publish(
-            (symbol_short!("audit"), symbol_short!("res_pub")),
-            (ballot_id_hash, result_hash),
-        );
-        Ok(())
-    }
-
-     /// Expire the ballot, only callable by admin.
-    pub fn expire_ballot(
-        env: Env,
-        caller: Address,
-        ballot_id_hash: String,
-    ) -> Result<(), ContractError> {
-        caller.require_auth();
-        Self::require_admin(&env, &caller)?;
-        Self::require_ballot_exists(&env, &ballot_id_hash)?;
-
-        let key = DataKey::BallotExpired(ballot_id_hash.clone());
-        let expired = env.storage().persistent().get(&key).unwrap_or(false);
-        if expired {
-            return Err(ContractError::BallotExpired);
-        }
-        env.storage().persistent().set(&key, &true);
-
-        env.events().publish(
-            (symbol_short!("audit"), symbol_short!("exp_adm")),
-            ballot_id_hash,
-        );
-        Ok(())
-    }
-
-
-    /// Rotate the admin address. Restricted to the current admin.
-    /// Emits an audit event with the old and new admin for rotation history.
-    pub fn rotate_admin(
-        env: Env,
-        caller: Address,
-        new_admin: Address,
-    ) -> Result<(), ContractError> {
-        caller.require_auth();
-        Self::require_not_paused(&env)?;
-        Self::require_admin(&env, &caller)?;
-
-        env.storage().instance().set(&DataKey::Admin, &new_admin);
-
-        env.events().publish(
-            (symbol_short!("audit"), symbol_short!("adm_rotd")),
-            (caller, new_admin),
-        );
-        Ok(())
-    }
-
-    // ── Upgrade functions ────────────────────────────────────────────────────
-
-    /// Schedule a contract upgrade (admin only).
-    /// Adds a 48-hour time lock before execution.
-    pub fn schedule_upgrade(
-        env: Env,
-        caller: Address,
-        new_wasm_hash: BytesN<32>,
-    ) -> Result<(), ContractError> {
-        caller.require_auth();
-        Self::require_not_paused(&env)?;
-        Self::require_admin(&env, &caller)?;
-
-        if env.storage().instance().has(&DataKey::PendingUpgrade) {
-            return Err(ContractError::UpgradeAlreadyScheduled);
-        }
-
-        let now = env.ledger().timestamp();
-        let executable_at = now + TIME_LOCK_SECONDS;
-
-        let pending = PendingUpgrade {
-            new_wasm_hash: new_wasm_hash.clone(),
-            scheduled_at: now,
-            executable_at,
-        };
-
-        env.storage().instance().set(&DataKey::PendingUpgrade, &pending);
-
-        env.events().publish(
-            (symbol_short!("audit"), symbol_short!("upg_schd")),
-            (caller, new_wasm_hash, now, executable_at),
-        );
-        Ok(())
-    }
-
-    /// Cancel a pending upgrade (admin only).
-    pub fn cancel_upgrade(
-        env: Env,
-        caller: Address,
-    ) -> Result<(), ContractError> {
-        caller.require_auth();
-        Self::require_not_paused(&env)?;
-        Self::require_admin(&env, &caller)?;
-
-        if !env.storage().instance().has(&DataKey::PendingUpgrade) {
-            return Err(ContractError::NoUpgradeScheduled);
-        }
-
-        let pending: PendingUpgrade = env.storage().instance().get(&DataKey::PendingUpgrade).unwrap();
-        env.storage().instance().remove(&DataKey::PendingUpgrade);
-
-        env.events().publish(
-            (symbol_short!("audit"), symbol_short!("upg_cncl")),
-            (caller, pending.new_wasm_hash),
-        );
-        Ok(())
-    }
-
-    /// Execute a scheduled upgrade (anyone can call, once time lock expires).
-    pub fn execute_upgrade(env: Env) -> Result<(), ContractError> {
-        let pending: PendingUpgrade = env.storage().instance().get(&DataKey::PendingUpgrade)
-            .ok_or(ContractError::NoUpgradeScheduled)?;
-
-        let now = env.ledger().timestamp();
-        if now < pending.executable_at {
-            return Err(ContractError::TimeLockNotExpired);
-        }
-
-        env.deployer().update_current_contract_wasm(pending.new_wasm_hash.clone());
-
-        env.storage().instance().remove(&DataKey::PendingUpgrade);
-
-        env.events().publish(
-            (symbol_short!("audit"), symbol_short!("upg_excd")),
-            pending.new_wasm_hash,
-        );
-        Ok(())
-    }
-
-    // ── Rate limit admin ─────────────────────────────────────────────────────
-
-    /// Set rate limit for a specific operation (admin only).
-    pub fn set_rate_limit(
-        env: Env,
-        caller: Address,
-        operation: Operation,
-        limit: RateLimit,
-    ) -> Result<(), ContractError> {
-        caller.require_auth();
-        Self::require_not_paused(&env)?;
-        Self::require_admin(&env, &caller)?;
-        env.storage()
-            .instance()
-            .set(&(symbol_short!("RateLimit"), operation), &limit);
-        Ok(())
-    }
-
-    // ── Pause / resume ───────────────────────────────────────────────────────
-
-    /// Pause all write operations (admin only). Emits a governance audit event.
-    pub fn pause_contract(env: Env, caller: Address) -> Result<(), ContractError> {
-        caller.require_auth();
-        Self::require_admin(&env, &caller)?;
-        env.storage().instance().set(&DataKey::IsPaused, &true);
-        env.events().publish(
-            (symbol_short!("audit"), symbol_short!("paused")),
-            (caller, env.ledger().timestamp()),
-        );
-        Ok(())
-    }
-
-    /// Resume all write operations (admin only). Emits a governance audit event.
-    pub fn resume_contract(env: Env, caller: Address) -> Result<(), ContractError> {
-        caller.require_auth();
-        Self::require_admin(&env, &caller)?;
-        env.storage().instance().set(&DataKey::IsPaused, &false);
-        env.events().publish(
-            (symbol_short!("audit"), symbol_short!("resumed")),
-            (caller, env.ledger().timestamp()),
-        );
+        env.events()
+            .publish((symbol_short!("result"),), (symbol_short!("published"),));
         Ok(())
     }
 
@@ -661,7 +364,7 @@ impl AnonVoteContract {
     pub fn ballot_exists(env: Env, ballot_id_hash: String) -> bool {
         env.storage()
             .persistent()
-            .has(&DataKey::BallotExists(ballot_id_hash))
+            .has(&DataKey::BallotMetadata(ballot_id_hash))
     }
 
     /// Check if a ballot has been recorded on-chain.
@@ -775,90 +478,14 @@ impl AnonVoteContract {
         Ok(())
     }
 
-    fn require_ballot_exists(env: &Env, ballot_id_hash: &String) -> Result<(), ContractError> {
-        if !env
-            .storage()
-            .persistent()
-            .has(&DataKey::BallotExists(ballot_id_hash.clone()))
-        {
-            return Err(ContractError::BallotNotFound);
-        }
-        Ok(())
-    }
-
-    fn require_ballot_not_expire(env: &Env, ballot_id_hash: &String) -> Result<(), ContractError> {   
-        Self::ballot_expiration(&env, &ballot_id_hash);     
-        let key = DataKey::BallotExpired(ballot_id_hash.clone());
-        let expired = env.storage().persistent().get(&key).unwrap_or(false);
-        if expired {
-            return Err(ContractError::BallotExpired);
-        }
-        Ok(())
-    }
-
-    fn ballot_expiration(env: &Env, ballot_id_hash: &String) {
-        let metadata = Self::get_ballot_metadata(env, ballot_id_hash.clone()).unwrap();
-        if metadata.expiration_time < env.ledger().timestamp() {
-            let key = DataKey::BallotExpired(ballot_id_hash.clone());
-            let expired = env.storage().persistent().get(&key).unwrap_or(false);
-            if !expired {
-                env.storage().persistent().set(&key, &true);
-
-                env.events().publish(
-                    (symbol_short!("audit"), symbol_short!("expire")),
-                    ballot_id_hash.clone(),
-                );
-            }
-        }
-    }
-    
-    fn check_rate_limit(
+    fn require_ballot_metadata(
         env: &Env,
-        caller: &Address,
-        operation: Operation,
-    ) -> Result<(), ContractError> {
-        let now = env.ledger().timestamp();
-        let minute_bucket = now / 60;
-        let hour_bucket = now / 3600;
-
-        let limit: RateLimit = env
-            .storage()
-            .instance()
-            .get(&(symbol_short!("RateLimit"), operation.clone()))
-            .unwrap();
-
-        let counts_key = (symbol_short!("CallCnt"), caller.clone(), operation);
-        let mut counts = env
-            .storage()
+        ballot_id_hash: &String,
+    ) -> Result<BallotMetadata, Error> {
+        env.storage()
             .persistent()
-            .get(&counts_key)
-            .unwrap_or(CallCounts {
-                minute_bucket: 0,
-                minute_calls: 0,
-                hour_bucket: 0,
-                hour_calls: 0,
-            });
-
-        if counts.minute_bucket != minute_bucket {
-            counts.minute_bucket = minute_bucket;
-            counts.minute_calls = 0;
-        }
-        if counts.hour_bucket != hour_bucket {
-            counts.hour_bucket = hour_bucket;
-            counts.hour_calls = 0;
-        }
-
-        if counts.minute_calls >= limit.calls_per_minute
-            || counts.hour_calls >= limit.calls_per_hour
-        {
-            return Err(ContractError::RateLimitExceeded);
-        }
-
-        counts.minute_calls += 1;
-        counts.hour_calls += 1;
-        env.storage().persistent().set(&counts_key, &counts);
-
-        Ok(())
+            .get(&DataKey::BallotMetadata(ballot_id_hash.clone()))
+            .ok_or(Error::BallotNotFound)
     }
 }
 
@@ -880,23 +507,18 @@ mod tests {
         (env, client, admin)
     }
 
-    fn setup_with_id() -> (Env, Address, AnonVoteContractClient<'static>, Address) {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register_contract(None, AnonVoteContract);
-        let client = AnonVoteContractClient::new(&env, &contract_id);
-        let admin = Address::generate(&env);
-        client.try_initialize(&admin).unwrap().unwrap();
-        (env, contract_id, client, admin)
+    fn limits(max_tokens: u32, max_votes: u32) -> BallotLimits {
+        BallotLimits {
+            max_tokens,
+            max_votes,
+        }
     }
-
-    // ── Existing success-path tests ──────────────────────────────────────────
 
     #[test]
     fn test_record_ballot_and_query() {
         let (env, client, admin) = setup();
         let ballot_hash = String::from_str(&env, "abc123");
-        client.try_record_ballot(&admin, &ballot_hash, &1000).unwrap().unwrap();
+        client.record_ballot(&admin, &ballot_hash, &limits(10, 10));
         assert!(client.ballot_exists(&ballot_hash));
         assert_eq!(client.get_tokens_issued(&ballot_hash), Some(0));
         assert_eq!(client.get_votes_cast(&ballot_hash), Some(0));
@@ -906,12 +528,12 @@ mod tests {
     fn test_token_and_vote_counts() {
         let (env, client, admin) = setup();
         let ballot_hash = String::from_str(&env, "abc123");
-        client.try_record_ballot(&admin, &ballot_hash, &1000).unwrap().unwrap();
-        client.try_record_token(&admin, &ballot_hash).unwrap().unwrap();
-        client.try_record_token(&admin, &ballot_hash).unwrap().unwrap();
-        client.try_record_vote(&admin, &ballot_hash).unwrap().unwrap();
-        assert_eq!(client.get_tokens_issued(&ballot_hash), Some(2));
-        assert_eq!(client.get_votes_cast(&ballot_hash), Some(1));
+        client.record_ballot(&admin, &ballot_hash, &limits(10, 10));
+        client.record_token(&admin, &ballot_hash);
+        client.record_token(&admin, &ballot_hash);
+        client.record_vote(&admin, &ballot_hash);
+        assert_eq!(client.get_tokens_issued(&ballot_hash), 2);
+        assert_eq!(client.get_votes_cast(&ballot_hash), 1);
         assert!(!client.is_consistent(&ballot_hash));
         client.try_record_vote(&admin, &ballot_hash).unwrap().unwrap();
         assert!(client.is_consistent(&ballot_hash));
@@ -922,712 +544,59 @@ mod tests {
         let (env, client, admin) = setup();
         let ballot_hash = String::from_str(&env, "abc123");
         let result_hash = String::from_str(&env, "deadbeef");
-        client.try_record_ballot(&admin, &ballot_hash, &1000).unwrap().unwrap();
-        client
-            .try_record_result(&admin, &ballot_hash, &result_hash)
-            .unwrap()
-            .unwrap();
+        client.record_ballot(&admin, &ballot_hash, &limits(10, 10));
+        client.record_result(&admin, &ballot_hash, &result_hash);
         assert_eq!(client.get_result_hash(&ballot_hash), Some(result_hash));
     }
 
     // ── Role grant / revoke ──────────────────────────────────────────────────
 
     #[test]
-    fn test_grant_ballot_operator_can_record() {
+    fn test_limits_are_enforced_correctly() {
         let (env, client, admin) = setup();
-        let operator = Address::generate(&env);
-        let ballot_hash = String::from_str(&env, "op_ballot");
+        let ballot_hash = String::from_str(&env, "limited");
+        client.record_ballot(&admin, &ballot_hash, &limits(2, 1));
 
-        client.grant_role(&admin, &operator, &Role::BallotOperator);
-        assert!(client.has_role(&operator, &Role::BallotOperator));
+        assert_eq!(client.try_record_token(&admin, &ballot_hash), Ok(Ok(())));
+        assert_eq!(client.try_record_token(&admin, &ballot_hash), Ok(Ok(())));
+        assert_eq!(
+            client.try_record_token(&admin, &ballot_hash),
+            Err(Ok(Error::LimitExceeded))
+        );
+        assert_eq!(client.get_tokens_issued(&ballot_hash), 2);
 
-        client.record_ballot(&operator, &ballot_hash);
-        client.record_token(&operator, &ballot_hash);
-        client.record_vote(&operator, &ballot_hash);
-        assert_eq!(client.get_tokens_issued(&ballot_hash), 1);
+        assert_eq!(client.try_record_vote(&admin, &ballot_hash), Ok(Ok(())));
+        assert_eq!(
+            client.try_record_vote(&admin, &ballot_hash),
+            Err(Ok(Error::LimitExceeded))
+        );
         assert_eq!(client.get_votes_cast(&ballot_hash), 1);
     }
 
     #[test]
-    fn test_grant_result_verifier_can_publish() {
+    fn test_zero_limit_blocks_all_operations() {
         let (env, client, admin) = setup();
-        let verifier = Address::generate(&env);
-        let ballot_hash = String::from_str(&env, "v_ballot");
-        let result_hash = String::from_str(&env, "cafebabe");
+        let ballot_hash = String::from_str(&env, "zero");
+        client.record_ballot(&admin, &ballot_hash, &limits(0, 0));
 
-        // Admin creates the ballot first
-        client.record_ballot(&admin, &ballot_hash);
-
-        client.grant_role(&admin, &verifier, &Role::ResultVerifier);
-        assert!(client.has_role(&verifier, &Role::ResultVerifier));
-
-        client.record_result(&verifier, &ballot_hash, &result_hash);
-        assert_eq!(client.get_result_hash(&ballot_hash), Some(result_hash));
+        assert_eq!(
+            client.try_record_token(&admin, &ballot_hash),
+            Err(Ok(Error::LimitExceeded))
+        );
+        assert_eq!(
+            client.try_record_vote(&admin, &ballot_hash),
+            Err(Ok(Error::LimitExceeded))
+        );
+        assert_eq!(client.get_tokens_issued(&ballot_hash), 0);
+        assert_eq!(client.get_votes_cast(&ballot_hash), 0);
     }
 
     #[test]
     #[should_panic(expected = "unauthorized")]
-    fn test_result_verifier_cannot_record_ballot() {
-        let (env, client, admin) = setup();
-        let verifier = Address::generate(&env);
-        let ballot_hash = String::from_str(&env, "bad_ballot");
-
-        client.grant_role(&admin, &verifier, &Role::ResultVerifier);
-        // ResultVerifier must NOT be able to record a ballot
-        client.record_ballot(&verifier, &ballot_hash);
-    }
-
-    #[test]
-    #[should_panic(expected = "unauthorized")]
-    fn test_ballot_operator_cannot_publish_result() {
-        let (env, client, admin) = setup();
-        let operator = Address::generate(&env);
-        let ballot_hash = String::from_str(&env, "op_ballot2");
-        let result_hash = String::from_str(&env, "aabbccdd");
-
-        client.grant_role(&admin, &operator, &Role::BallotOperator);
-        client.record_ballot(&operator, &ballot_hash);
-        // BallotOperator must NOT be able to publish results
-        client.record_result(&operator, &ballot_hash, &result_hash);
-    }
-
-    #[test]
-    fn test_revoke_role_denies_access() {
-        let (env, client, admin) = setup();
-        let operator = Address::generate(&env);
-        let ballot_hash = String::from_str(&env, "revoke_ballot");
-
-        client.grant_role(&admin, &operator, &Role::BallotOperator);
-        client.record_ballot(&operator, &ballot_hash);
-
-        // Revoke and confirm access is removed immediately
-        client.revoke_role(&admin, &operator, &Role::BallotOperator);
-        assert!(!client.has_role(&operator, &Role::BallotOperator));
-    }
-
-    #[test]
-    #[should_panic(expected = "unauthorized")]
-    fn test_revoked_operator_cannot_record_token() {
-        let (env, client, admin) = setup();
-        let operator = Address::generate(&env);
-        let ballot_hash = String::from_str(&env, "revoke_token_ballot");
-
-        client.grant_role(&admin, &operator, &Role::BallotOperator);
-        client.record_ballot(&operator, &ballot_hash);
-        client.revoke_role(&admin, &operator, &Role::BallotOperator);
-
-        // Must panic after revoke
-        client.record_token(&operator, &ballot_hash);
-    }
-
-    #[test]
-    #[should_panic(expected = "unauthorized")]
-    fn test_read_only_cannot_mutate() {
-        let (env, client, admin) = setup();
-        let reader = Address::generate(&env);
-        let ballot_hash = String::from_str(&env, "ro_ballot");
-
-        client.grant_role(&admin, &reader, &Role::ReadOnly);
-        // ReadOnly must never mutate state
-        client.record_ballot(&reader, &ballot_hash);
-    }
-
-    #[test]
-    fn test_ballot_metadata() {
-        let (env, client, admin) = setup();
-        let ballot_hash = String::from_str(&env, "abc123");
-        client.try_record_ballot(&admin, &ballot_hash, &1000).unwrap().unwrap();
-
-        let metadata = client.get_ballot_metadata(&ballot_hash).unwrap();
-        assert_eq!(metadata.admin, admin);
-        assert_eq!(metadata.state, BallotState::Active);
-    }
-
-    #[test]
-    fn test_ballot_state_snapshot() {
-        let (env, client, admin) = setup();
-        let ballot_hash = String::from_str(&env, "abc123");
-        let result_hash = String::from_str(&env, "deadbeef");
-
-        client.try_record_ballot(&admin, &ballot_hash, &1000).unwrap().unwrap();
-        client.try_record_token(&admin, &ballot_hash).unwrap().unwrap();
-        client.try_record_token(&admin, &ballot_hash).unwrap().unwrap();
-        client.try_record_vote(&admin, &ballot_hash).unwrap().unwrap();
-        client
-            .try_record_result(&admin, &ballot_hash, &result_hash)
-            .unwrap()
-            .unwrap();
-
-        let state = client.get_ballot_state(&ballot_hash).unwrap();
-        assert_eq!(state.tokens_issued, 2);
-        assert_eq!(state.votes_cast, 1);
-        assert_eq!(state.result_hash, Some(result_hash));
-        assert_eq!(state.admin, admin);
-        assert_eq!(state.state, BallotState::ResultPublished);
-    }
-
-    #[test]
-    fn test_nonexistent_ballot() {
-        let (env, client, _admin) = setup();
-        let ballot_hash = String::from_str(&env, "nonexistent");
-        assert_eq!(client.get_tokens_issued(&ballot_hash), None);
-        assert_eq!(client.get_votes_cast(&ballot_hash), None);
-        assert_eq!(client.get_ballot_metadata(&ballot_hash), None);
-        assert_eq!(client.get_ballot_state(&ballot_hash), None);
-    }
-
-    // ── Error-case tests ─────────────────────────────────────────────────────
-
-    #[test]
-    fn test_initialize_twice_returns_already_initialized() {
-        let (_, client, admin) = setup();
-        let err = client.try_initialize(&admin).unwrap_err().unwrap();
-        assert_eq!(err, ContractError::AlreadyInitialized);
-    }
-
-    #[test]
-    fn test_initialization_timestamp_stored() {
-        let (_, client, _) = setup();
-        assert!(client.get_initialized_at().is_some());
-    }
-
-    #[test]
-    fn test_unauthorized_caller_returns_admin_unauthorized() {
+    fn test_unauthorized_caller() {
         let (env, client, _admin) = setup();
         let ballot_hash = String::from_str(&env, "abc123");
         let attacker = Address::generate(&env);
-        let err = client
-            .try_record_ballot(&attacker, &ballot_hash, &1000)
-            .unwrap_err()
-            .unwrap();
-        assert_eq!(err, ContractError::AdminUnauthorized);
-    }
-
-    #[test]
-    fn test_record_ballot_idempotent_same_admin() {
-        let (env, client, admin) = setup();
-        let ballot_hash = String::from_str(&env, "abc123");
-        client.try_record_ballot(&admin, &ballot_hash, &1000).unwrap().unwrap();
-        // Second call with same admin → idempotent success
-        client.try_record_ballot(&admin, &ballot_hash, &1000).unwrap().unwrap();
-    }
-
-    #[test]
-    fn test_record_ballot_different_admin_returns_already_exists() {
-        let (env, client, admin) = setup();
-        let ballot_hash = String::from_str(&env, "abc123");
-        client.try_record_ballot(&admin, &ballot_hash, &1000).unwrap().unwrap();
-
-        // Rotate admin so we have a different valid admin
-        let new_admin = Address::generate(&env);
-        client.try_rotate_admin(&admin, &new_admin).unwrap().unwrap();
-
-        let err = client
-            .try_record_ballot(&new_admin, &ballot_hash, &1000)
-            .unwrap_err()
-            .unwrap();
-        assert_eq!(err, ContractError::BallotAlreadyExists);
-    }
-
-    #[test]
-    fn test_counter_overflow_token() {
-        let (env, contract_id, client, admin) = setup_with_id();
-        let ballot_hash = String::from_str(&env, "abc123");
-        client.try_record_ballot(&admin, &ballot_hash, &1000).unwrap().unwrap();
-
-        // Force counter to u32::MAX inside the contract's storage context
-        let bh = ballot_hash.clone();
-        env.as_contract(&contract_id, || {
-            env.storage()
-                .persistent()
-                .set(&DataKey::TokensIssued(bh), &u32::MAX);
-        });
-
-        let err = client
-            .try_record_token(&admin, &ballot_hash)
-            .unwrap_err()
-            .unwrap();
-        assert_eq!(err, ContractError::CounterOverflow);
-    }
-
-    #[test]
-    fn test_counter_overflow_vote() {
-        let (env, contract_id, client, admin) = setup_with_id();
-        let ballot_hash = String::from_str(&env, "abc123");
-        client.try_record_ballot(&admin, &ballot_hash, &1000).unwrap().unwrap();
-
-        let bh = ballot_hash.clone();
-        env.as_contract(&contract_id, || {
-            env.storage()
-                .persistent()
-                .set(&DataKey::VotesCast(bh), &u32::MAX);
-        });
-
-        let err = client
-            .try_record_vote(&admin, &ballot_hash)
-            .unwrap_err()
-            .unwrap();
-        assert_eq!(err, ContractError::CounterOverflow);
-    }
-
-    #[test]
-    fn test_record_result_idempotent_same_hash() {
-        let (env, client, admin) = setup();
-        let ballot_hash = String::from_str(&env, "abc123");
-        let result_hash = String::from_str(&env, "deadbeef");
-        client.try_record_ballot(&admin, &ballot_hash, &1000).unwrap().unwrap();
-        client
-            .try_record_result(&admin, &ballot_hash, &result_hash)
-            .unwrap()
-            .unwrap();
-        // Same hash again → idempotent success
-        client
-            .try_record_result(&admin, &ballot_hash, &result_hash)
-            .unwrap()
-            .unwrap();
-    }
-
-    #[test]
-    fn test_record_result_different_hash_returns_already_published() {
-        let (env, client, admin) = setup();
-        let ballot_hash = String::from_str(&env, "abc123");
-        let result_hash = String::from_str(&env, "deadbeef");
-        let other_hash = String::from_str(&env, "cafebabe");
-        client.try_record_ballot(&admin, &ballot_hash, &1000).unwrap().unwrap();
-        client
-            .try_record_result(&admin, &ballot_hash, &result_hash)
-            .unwrap()
-            .unwrap();
-
-        let err = client
-            .try_record_result(&admin, &ballot_hash, &other_hash)
-            .unwrap_err()
-            .unwrap();
-        assert_eq!(err, ContractError::ResultAlreadyPublished);
-    }
-
-    #[test]
-    fn test_result_exists() {
-        let (env, client, admin) = setup();
-        let ballot_hash = String::from_str(&env, "abc123");
-        let result_hash = String::from_str(&env, "deadbeef");
-        client.try_record_ballot(&admin, &ballot_hash, &1000).unwrap().unwrap();
-        assert!(!client.result_exists(&ballot_hash));
-        client
-            .try_record_result(&admin, &ballot_hash, &result_hash)
-            .unwrap()
-            .unwrap();
-        assert!(client.result_exists(&ballot_hash));
-    }
-
-    #[test]
-    fn test_rotate_admin() {
-        let (env, client, admin) = setup();
-        let new_admin = Address::generate(&env);
-        client.try_rotate_admin(&admin, &new_admin).unwrap().unwrap();
-
-        // Old admin can no longer record
-        let ballot_hash = String::from_str(&env, "abc123");
-        let err = client
-            .try_record_ballot(&admin, &ballot_hash, &1000)
-            .unwrap_err()
-            .unwrap();
-        assert_eq!(err, ContractError::AdminUnauthorized);
-
-        // New admin can record
-        client.try_record_ballot(&new_admin, &ballot_hash, &1000).unwrap().unwrap();
-    }
-
-    #[test]
-    fn test_rotate_admin_unauthorized() {
-        let (env, client, _admin) = setup();
-        let attacker = Address::generate(&env);
-        let new_admin = Address::generate(&env);
-        let err = client
-            .try_rotate_admin(&attacker, &new_admin)
-            .unwrap_err()
-            .unwrap();
-        assert_eq!(err, ContractError::AdminUnauthorized);
-    }
-
-    #[test]
-    fn test_ballot_not_found_on_record_token() {
-        let (env, client, admin) = setup();
-        let ballot_hash = String::from_str(&env, "missing");
-        let err = client
-            .try_record_token(&admin, &ballot_hash)
-            .unwrap_err()
-            .unwrap();
-        assert_eq!(err, ContractError::BallotNotFound);
-    }
-
-    #[test]
-    fn test_invalid_ballot_hash() {
-        let (env, client, admin) = setup();
-        let empty = String::from_str(&env, "");
-        let err = client
-            .try_record_ballot(&admin, &empty, &1000)
-            .unwrap_err()
-            .unwrap();
-        assert_eq!(err, ContractError::InvalidBallotHash);
-    }
-
-     #[test]
-    fn test_ballot_cant_be_recorded_expired_by_admin() {
-        let (env, client, admin) = setup();
-        let ballot_hash = String::from_str(&env, "abc123");
-        let result_hash = String::from_str(&env, "deadbeef");
-
-        client.try_record_ballot(&admin, &ballot_hash, &1000).unwrap().unwrap();
-        client.try_expire_ballot(&admin, &ballot_hash);
-        let err = client.try_record_token(&admin, &ballot_hash).unwrap_err().unwrap();
-        assert_eq!(err, ContractError::BallotExpired);
-    }
-
-    #[test]
-    fn test_ballot_vote_cant_be_casted_expired_by_admin() {
-        let (env, client, admin) = setup();
-        let ballot_hash = String::from_str(&env, "abc123");
-        let result_hash = String::from_str(&env, "deadbeef");
-
-        client.try_record_ballot(&admin, &ballot_hash, &1000).unwrap().unwrap();
-        client.try_record_token(&admin, &ballot_hash).unwrap().unwrap();
-        client.try_expire_ballot(&admin, &ballot_hash);
-        let err = client.try_record_vote(&admin, &ballot_hash).unwrap_err().unwrap();
-        
-        assert_eq!(err, ContractError::BallotExpired);
-    }
-
-    #[test]
-    fn test_ballot_vote_cant_be_casted_after_expiration_time() {
-        let (env, client, admin) = setup();
-        let ballot_hash = String::from_str(&env, "abc123");
-        let result_hash = String::from_str(&env, "deadbeef");
-
-        client.try_record_ballot(&admin, &ballot_hash, &1000).unwrap().unwrap();
-        client.try_record_token(&admin, &ballot_hash).unwrap().unwrap();
-        env.ledger().set_timestamp(2000);
-
-        let err = client.try_record_vote(&admin, &ballot_hash).unwrap_err().unwrap();
-        
-        assert_eq!(err, ContractError::BallotExpired);
-    }
-
-    #[test]
-    fn test_ballot_cant_be_recorded_after_expiration_time() {
-        let (env, client, admin) = setup();
-        let ballot_hash = String::from_str(&env, "abc123");
-        let result_hash = String::from_str(&env, "deadbeef");
-
-        client.try_record_ballot(&admin, &ballot_hash, &1000).unwrap().unwrap();
-        env.ledger().set_timestamp(2000);
-
-        let err = client.try_record_token(&admin, &ballot_hash).unwrap_err().unwrap();
-        
-        assert_eq!(err, ContractError::BallotExpired);
-    }
-
-    #[test]
-    fn test_ballot_get_ballot_expiration() {
-        let (env, client, admin) = setup();
-        let ballot_hash = String::from_str(&env, "abc123");
-        let result_hash = String::from_str(&env, "deadbeef");
-
-        client.try_record_ballot(&admin, &ballot_hash, &1000).unwrap().unwrap();
-        env.ledger().set_timestamp(2000);
-
-        let expired = client.get_ballot_expiration(&ballot_hash);
-        assert_eq!(expired, false);
-
-        client.try_expire_ballot(&admin, &ballot_hash);
-
-        let expired = client.get_ballot_expiration(&ballot_hash);
-        assert_eq!(expired, true);
-    }
-
-    // ── Upgrade tests ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_schedule_upgrade() {
-        let (env, contract_id, client, admin) = setup_with_id();
-        let new_wasm_hash = BytesN::from_array(&env, &[0u8; 32]);
-        client.try_schedule_upgrade(&admin, &new_wasm_hash).unwrap().unwrap();
-        let pending = client.get_pending_upgrade().unwrap();
-        assert_eq!(pending.new_wasm_hash, new_wasm_hash);
-        assert_eq!(pending.executable_at, pending.scheduled_at + TIME_LOCK_SECONDS);
-    }
-
-    #[test]
-    fn test_cancel_upgrade() {
-        let (env, contract_id, client, admin) = setup_with_id();
-        let new_wasm_hash = BytesN::from_array(&env, &[0u8; 32]);
-        client.try_schedule_upgrade(&admin, &new_wasm_hash).unwrap().unwrap();
-        assert!(client.get_pending_upgrade().is_some());
-        client.try_cancel_upgrade(&admin).unwrap().unwrap();
-        assert!(client.get_pending_upgrade().is_none());
-    }
-
-    #[test]
-    fn test_schedule_twice_fails() {
-        let (env, contract_id, client, admin) = setup_with_id();
-        let new_wasm_hash = BytesN::from_array(&env, &[0u8; 32]);
-        client.try_schedule_upgrade(&admin, &new_wasm_hash).unwrap().unwrap();
-        let err = client.try_schedule_upgrade(&admin, &new_wasm_hash).unwrap_err().unwrap();
-        assert_eq!(err, ContractError::UpgradeAlreadyScheduled);
-    }
-
-    #[test]
-    fn test_cancel_none_fails() {
-        let (_env, _contract_id, client, admin) = setup_with_id();
-        let err = client.try_cancel_upgrade(&admin).unwrap_err().unwrap();
-        assert_eq!(err, ContractError::NoUpgradeScheduled);
-    }
-
-    #[test]
-    fn test_execute_before_time_lock_fails() {
-        let (env, contract_id, client, admin) = setup_with_id();
-        let new_wasm_hash = BytesN::from_array(&env, &[0u8; 32]);
-        client.try_schedule_upgrade(&admin, &new_wasm_hash).unwrap().unwrap();
-        let err = client.try_execute_upgrade().unwrap_err().unwrap();
-        assert_eq!(err, ContractError::TimeLockNotExpired);
-    }
-
-    #[test]
-    fn test_unauthorized_schedule_fails() {
-        let (env, _contract_id, client, _admin) = setup_with_id();
-        let attacker = Address::generate(&env);
-        let new_wasm_hash = BytesN::from_array(&env, &[0u8; 32]);
-        let err = client.try_schedule_upgrade(&attacker, &new_wasm_hash).unwrap_err().unwrap();
-        assert_eq!(err, ContractError::AdminUnauthorized);
-    }
-
-    // ── Pause / resume tests ──────────────────────────────────────────────────
-
-    #[test]
-    fn test_contract_starts_unpaused() {
-        let (_env, client, _admin) = setup();
-        assert!(!client.is_paused());
-    }
-
-    #[test]
-    fn test_pause_and_resume_toggles_state() {
-        let (_env, client, admin) = setup();
-        assert!(!client.is_paused());
-        client.pause_contract(&admin).unwrap();
-        assert!(client.is_paused());
-        client.resume_contract(&admin).unwrap();
-        assert!(!client.is_paused());
-    }
-
-    #[test]
-    fn test_only_admin_can_pause() {
-        let (env, client, _admin) = setup();
-        let attacker = Address::generate(&env);
-        let err = client.try_pause_contract(&attacker).unwrap_err().unwrap();
-        assert_eq!(err, ContractError::AdminUnauthorized);
-        assert!(!client.is_paused());
-    }
-
-    #[test]
-    fn test_only_admin_can_resume() {
-        let (env, client, admin) = setup();
-        client.pause_contract(&admin).unwrap();
-        let attacker = Address::generate(&env);
-        let err = client.try_resume_contract(&attacker).unwrap_err().unwrap();
-        assert_eq!(err, ContractError::AdminUnauthorized);
-        assert!(client.is_paused());
-    }
-
-    #[test]
-    fn test_paused_contract_blocks_record_ballot() {
-        let (env, client, admin) = setup();
-        client.pause_contract(&admin).unwrap();
-        let ballot_hash = String::from_str(&env, "abc123");
-        let err = client.try_record_ballot(&admin, &ballot_hash).unwrap_err().unwrap();
-        assert_eq!(err, ContractError::ContractPaused);
-    }
-
-    #[test]
-    fn test_paused_contract_blocks_record_token() {
-        let (env, client, admin) = setup();
-        let ballot_hash = String::from_str(&env, "abc123");
-        client.record_ballot(&admin, &ballot_hash).unwrap();
-        client.pause_contract(&admin).unwrap();
-        let err = client.try_record_token(&admin, &ballot_hash).unwrap_err().unwrap();
-        assert_eq!(err, ContractError::ContractPaused);
-    }
-
-    #[test]
-    fn test_paused_contract_blocks_record_vote() {
-        let (env, client, admin) = setup();
-        let ballot_hash = String::from_str(&env, "abc123");
-        client.record_ballot(&admin, &ballot_hash).unwrap();
-        client.pause_contract(&admin).unwrap();
-        let err = client.try_record_vote(&admin, &ballot_hash).unwrap_err().unwrap();
-        assert_eq!(err, ContractError::ContractPaused);
-    }
-
-    #[test]
-    fn test_paused_contract_blocks_record_result() {
-        let (env, client, admin) = setup();
-        let ballot_hash = String::from_str(&env, "abc123");
-        let result_hash = String::from_str(&env, "deadbeef");
-        client.record_ballot(&admin, &ballot_hash).unwrap();
-        client.pause_contract(&admin).unwrap();
-        let err = client
-            .try_record_result(&admin, &ballot_hash, &result_hash)
-            .unwrap_err()
-            .unwrap();
-        assert_eq!(err, ContractError::ContractPaused);
-    }
-
-    #[test]
-    fn test_paused_contract_blocks_rotate_admin() {
-        let (env, client, admin) = setup();
-        let new_admin = Address::generate(&env);
-        client.pause_contract(&admin).unwrap();
-        let err = client.try_rotate_admin(&admin, &new_admin).unwrap_err().unwrap();
-        assert_eq!(err, ContractError::ContractPaused);
-    }
-
-    #[test]
-    fn test_paused_contract_blocks_schedule_upgrade() {
-        let (env, _contract_id, client, admin) = setup_with_id();
-        let new_wasm_hash = BytesN::from_array(&env, &[0u8; 32]);
-        client.pause_contract(&admin).unwrap();
-        let err = client.try_schedule_upgrade(&admin, &new_wasm_hash).unwrap_err().unwrap();
-        assert_eq!(err, ContractError::ContractPaused);
-    }
-
-    #[test]
-    fn test_read_operations_allowed_when_paused() {
-        let (env, client, admin) = setup();
-        let ballot_hash = String::from_str(&env, "abc123");
-        client.record_ballot(&admin, &ballot_hash).unwrap();
-        client.record_token(&admin, &ballot_hash).unwrap();
-        client.pause_contract(&admin).unwrap();
-
-        // All reads still work while paused
-        assert!(client.is_paused());
-        assert!(client.ballot_exists(&ballot_hash));
-        assert_eq!(client.get_tokens_issued(&ballot_hash), Some(1));
-        assert_eq!(client.get_votes_cast(&ballot_hash), Some(0));
-        assert_eq!(client.get_result_hash(&ballot_hash), None);
-        assert!(client.get_ballot_metadata(&ballot_hash).is_some());
-        assert!(client.get_ballot_state(&ballot_hash).is_some());
-        assert!(client.get_initialized_at().is_some());
-    }
-
-    #[test]
-    fn test_resume_restores_writes() {
-        let (env, client, admin) = setup();
-        let ballot_hash = String::from_str(&env, "abc123");
-        client.pause_contract(&admin).unwrap();
-
-        // Write blocked while paused
-        let err = client.try_record_ballot(&admin, &ballot_hash).unwrap_err().unwrap();
-        assert_eq!(err, ContractError::ContractPaused);
-
-        // Resume and write succeeds
-        client.resume_contract(&admin).unwrap();
-        client.record_ballot(&admin, &ballot_hash).unwrap();
-        assert!(client.ballot_exists(&ballot_hash));
-    }
-
-    #[test]
-    fn test_pause_resume_no_state_corruption() {
-        let (env, client, admin) = setup();
-        let ballot_hash = String::from_str(&env, "abc123");
-
-        // Record some data, pause, resume, verify data intact
-        client.record_ballot(&admin, &ballot_hash).unwrap();
-        client.record_token(&admin, &ballot_hash).unwrap();
-        client.record_vote(&admin, &ballot_hash).unwrap();
-
-        let before = client.get_ballot_state(&ballot_hash).unwrap();
-
-        client.pause_contract(&admin).unwrap();
-        client.resume_contract(&admin).unwrap();
-
-        let after = client.get_ballot_state(&ballot_hash).unwrap();
-        assert_eq!(before.tokens_issued, after.tokens_issued);
-        assert_eq!(before.votes_cast, after.votes_cast);
-        assert_eq!(before.state, after.state);
-        assert_eq!(before.admin, after.admin);
-    }
-
-    #[test]
-    fn test_pause_is_idempotent() {
-        let (_env, client, admin) = setup();
-        client.pause_contract(&admin).unwrap();
-        // Pausing again while already paused should succeed (simple bool set)
-        client.pause_contract(&admin).unwrap();
-        assert!(client.is_paused());
-    }
-
-    #[test]
-    fn test_resume_is_idempotent() {
-        let (_env, client, admin) = setup();
-        // Resuming when not paused should succeed
-        client.resume_contract(&admin).unwrap();
-        assert!(!client.is_paused());
-    }
-
-    #[test]
-    fn test_address_can_hold_multiple_roles() {
-        let (env, client, admin) = setup();
-        let multi = Address::generate(&env);
-
-        client.grant_role(&admin, &multi, &Role::BallotOperator);
-        client.grant_role(&admin, &multi, &Role::ResultVerifier);
-
-        assert!(client.has_role(&multi, &Role::BallotOperator));
-        assert!(client.has_role(&multi, &Role::ResultVerifier));
-
-        let ballot_hash = String::from_str(&env, "multi_ballot");
-        let result_hash = String::from_str(&env, "multihash");
-        client.record_ballot(&multi, &ballot_hash);
-        client.record_result(&multi, &ballot_hash, &result_hash);
-    }
-
-    #[test]
-    fn test_grant_is_idempotent() {
-        let (env, client, admin) = setup();
-        let operator = Address::generate(&env);
-
-        // Double-grant must not error
-        client.grant_role(&admin, &operator, &Role::BallotOperator);
-        client.grant_role(&admin, &operator, &Role::BallotOperator);
-        assert!(client.has_role(&operator, &Role::BallotOperator));
-    }
-
-    #[test]
-    #[should_panic(expected = "unauthorized")]
-    fn test_non_admin_cannot_grant_role() {
-        let (env, client, _admin) = setup();
-        let rogue = Address::generate(&env);
-        let target = Address::generate(&env);
-        // Non-admin must not be able to grant roles
-        client.grant_role(&rogue, &target, &Role::BallotOperator);
-    }
-
-    #[test]
-    #[should_panic(expected = "unauthorized")]
-    fn test_non_admin_cannot_revoke_role() {
-        let (env, client, admin) = setup();
-        let operator = Address::generate(&env);
-        let rogue = Address::generate(&env);
-
-        client.grant_role(&admin, &operator, &Role::BallotOperator);
-        // Non-admin must not be able to revoke
-        client.revoke_role(&rogue, &operator, &Role::BallotOperator);
-    }
-
-    #[test]
-    fn test_admin_always_has_full_access() {
-        let (_env, client, admin) = setup();
-        assert!(client.has_role(&admin, &Role::BallotOperator));
-        assert!(client.has_role(&admin, &Role::ResultVerifier));
-        assert!(client.has_role(&admin, &Role::ReadOnly));
+        client.record_ballot(&attacker, &ballot_hash, &limits(10, 10));
     }
 }

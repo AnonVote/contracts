@@ -166,50 +166,10 @@ export interface ConfigError {
   message: string;
 }
 
-export type ConfigValidationResult =
-  | { valid: true }
-  | { valid: false; error: ConfigError };
-
-/**
- * Validate that a contract ID is a well-formed Soroban contract address.
- * Exposed separately from validateSorobanConfig because readContract is
- * allowed to run without a secret key (it falls back to a throwaway keypair
- * for the simulation-only source account), so it only needs this check.
- */
-export function validateContractId(contractId: string): ConfigValidationResult {
-  if (!contractId || !StellarSdk.StrKey.isValidContract(contractId)) {
-    return {
-      valid: false,
-      error: {
-        field: "contractId",
-        message: "contractId must be a valid Soroban contract address (starts with 'C')",
-      },
-    };
-  }
-  return { valid: true };
+export interface BallotLimits {
+  maxTokens: number;
+  maxVotes: number;
 }
-
-/**
- * Validate that a SorobanConfig has a well-formed secret key and contract ID
- * before any RPC call is attempted. Uses stellar-sdk's StrKey checksum
- * validation (rather than a hand-rolled regex) so malformed keys are rejected
- * with a clear, typed error instead of failing later inside Keypair.fromSecret
- * or at RPC time with an opaque network error.
- */
-export function validateSorobanConfig(config: SorobanConfig): ConfigValidationResult {
-  if (!config.stellarSecretKey || !StellarSdk.StrKey.isValidEd25519SecretSeed(config.stellarSecretKey)) {
-    return {
-      valid: false,
-      error: {
-        field: "stellarSecretKey",
-        message: "stellarSecretKey must be a valid Stellar Ed25519 secret seed (starts with 'S')",
-      },
-    };
-  }
-  return validateContractId(config.contractId);
-}
-
-// ── Internal helpers ──────────────────────────────────────────────────────────
 
 function getRpcUrl(network: string): string {
   return network === "mainnet" ? SOROBAN_RPC_MAINNET : SOROBAN_RPC_TESTNET;
@@ -676,16 +636,16 @@ export async function sorobanFilterEvents(
 export async function sorobanRecordBallot(
   config: SorobanConfig,
   ballotIdHash: string,
-): Promise<SorobanInvokeResult> {
-  const configCheck = validateSorobanConfig(config);
-  if (!configCheck.valid) {
-    console.warn(`[Soroban] sorobanRecordBallot: ${configCheck.error.message}`);
-    return { txHash: "", success: false, ...makeError(SorobanErrorCode.NotConfigured) };
-  }
-  const caller = StellarSdk.Keypair.fromSecret(config.stellarSecretKey).publicKey();
+  limits: BallotLimits,
+): Promise<string> {
+  if (!config.contractId) return "";
   const result = await invokeContract(config, "record_ballot", [
     { value: caller, type: "address" },
     { value: ballotIdHash, type: "string" },
+    {
+      value: { max_tokens: limits.maxTokens, max_votes: limits.maxVotes },
+      type: "map",
+    },
   ]);
   if (!result.success && result.errorCode !== undefined) {
     console.error(
