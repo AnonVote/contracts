@@ -14,9 +14,11 @@ import {
   sorobanRecordResult,
   sorobanGetAuditCounts,
   sorobanResultExists,
+  sorobanGetAuditReport,
   SorobanErrorCode,
   type SorobanConfig,
 } from "./sorobanService";
+import * as StellarSdk from "stellar-sdk";
 
 const ADMIN_SECRET_KEY = "S" + "B".repeat(55);
 const OTHER_ADMIN_SECRET_KEY = "S" + "C".repeat(55);
@@ -173,5 +175,57 @@ describe("AnonVote ballot lifecycle (mocked contract, no live network)", () => {
 
     const afterResult = await sorobanResultExists(config, ballotIdHash);
     expect(afterResult).toBe(true);
+  });
+
+  it("sorobanGetAuditReport returns full report matching individual reads and verifies immutability", async () => {
+    const config = makeConfig();
+    const ballotIdHash = "ballot-hash-audit";
+
+    // Non-existent report should return null
+    const nonExistentReport = await sorobanGetAuditReport(config, "non-existent");
+    expect(nonExistentReport).toBeNull();
+
+    // Create ballot
+    await sorobanRecordBallot(config, ballotIdHash);
+
+    // Get report
+    const report1 = await sorobanGetAuditReport(config, ballotIdHash);
+    expect(report1).not.toBeNull();
+    
+    // Verify all required fields
+    const expectedAdmin = StellarSdk.Keypair.fromSecret(config.stellarSecretKey).publicKey();
+    expect(report1!.admin).toBe(expectedAdmin);
+    expect(report1!.created_at).toBe(1718880000); // Fixed in FakeLedger
+    expect(report1!.expiration_time).toBe(0);
+    expect(report1!.is_consistent).toBe(true);
+    expect(report1!.result_hash).toBeNull();
+    expect(report1!.state).toBe("Active");
+    expect(report1!.tokens_issued).toBe(0);
+    expect(report1!.votes_cast).toBe(0);
+
+    // Record token & vote and verify report matches individual reads
+    await sorobanRecordToken(config, ballotIdHash);
+    await sorobanRecordVote(config, ballotIdHash);
+
+    const counts = await sorobanGetAuditCounts(config, ballotIdHash);
+    expect(counts).not.toBeNull();
+    const report2 = await sorobanGetAuditReport(config, ballotIdHash);
+    expect(report2!.tokens_issued).toBe(counts!.tokensIssued);
+    expect(report2!.votes_cast).toBe(counts!.votesCast);
+    expect(report2!.is_consistent).toBe(counts!.isConsistent);
+    expect(report2!.is_consistent).toBe(true);
+
+    // Make inconsistent (another token) and verify
+    await sorobanRecordToken(config, ballotIdHash);
+    const report3 = await sorobanGetAuditReport(config, ballotIdHash);
+    expect(report3!.tokens_issued).toBe(2);
+    expect(report3!.votes_cast).toBe(1);
+    expect(report3!.is_consistent).toBe(false);
+
+    // Record result and verify state & result_hash transitions
+    await sorobanRecordResult(config, ballotIdHash, "election-result-hash");
+    const report4 = await sorobanGetAuditReport(config, ballotIdHash);
+    expect(report4!.state).toBe("ResultPublished");
+    expect(report4!.result_hash).toBe("election-result-hash");
   });
 });

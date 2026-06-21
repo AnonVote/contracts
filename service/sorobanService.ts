@@ -109,6 +109,17 @@ export interface BallotStateSnapshot {
   state_updated_at: number;
 }
 
+export interface BallotAuditReport {
+  admin: string;
+  created_at: number;
+  expiration_time: number;
+  is_consistent: boolean;
+  result_hash: string | null;
+  state: BallotState;
+  tokens_issued: number;
+  votes_cast: number;
+}
+
 export interface SorobanInvokeResult {
   txHash: string;
   success: boolean;
@@ -164,6 +175,43 @@ export interface SorobanEventData {
 export interface ConfigError {
   field: "stellarSecretKey" | "contractId";
   message: string;
+}
+
+export function validateContractId(
+  contractId: string,
+): { valid: true } | { valid: false; error: ConfigError } {
+  const isValid = StellarSdk.StrKey.isValidContract
+    ? StellarSdk.StrKey.isValidContract(contractId)
+    : (StellarSdk.StrKey as any).isValidContractId(contractId);
+  if (!isValid) {
+    return {
+      valid: false,
+      error: {
+        field: "contractId",
+        message: "Invalid contract ID format",
+      },
+    };
+  }
+  return { valid: true };
+}
+
+export function validateSorobanConfig(
+  config: SorobanConfig,
+): { valid: true } | { valid: false; error: ConfigError } {
+  if (!config.stellarSecretKey || !StellarSdk.StrKey.isValidEd25519SecretSeed(config.stellarSecretKey)) {
+    return {
+      valid: false,
+      error: {
+        field: "stellarSecretKey",
+        message: "Invalid stellarSecretKey format",
+      },
+    };
+  }
+  const contractCheck = validateContractId(config.contractId);
+  if (!contractCheck.valid) {
+    return contractCheck;
+  }
+  return { valid: true };
 }
 
 export interface BallotLimits {
@@ -636,14 +684,20 @@ export async function sorobanFilterEvents(
 export async function sorobanRecordBallot(
   config: SorobanConfig,
   ballotIdHash: string,
-  limits: BallotLimits,
-): Promise<string> {
-  if (!config.contractId) return "";
+  limits?: BallotLimits,
+): Promise<SorobanInvokeResult> {
+  const configCheck = validateSorobanConfig(config);
+  if (!configCheck.valid) {
+    console.warn(`[Soroban] sorobanRecordBallot: ${configCheck.error.message}`);
+    return { txHash: "", success: false, ...makeError(SorobanErrorCode.NotConfigured) };
+  }
+  const caller = StellarSdk.Keypair.fromSecret(config.stellarSecretKey).publicKey();
+  const ballotLimits = limits ?? { maxTokens: 10000, maxVotes: 10000 };
   const result = await invokeContract(config, "record_ballot", [
     { value: caller, type: "address" },
     { value: ballotIdHash, type: "string" },
     {
-      value: { max_tokens: limits.maxTokens, max_votes: limits.maxVotes },
+      value: { max_tokens: ballotLimits.maxTokens, max_votes: ballotLimits.maxVotes },
       type: "map",
     },
   ]);
@@ -886,6 +940,21 @@ export async function sorobanGetBallotState(
     { value: ballotIdHash, type: "string" },
   ]);
   return value as BallotStateSnapshot | null;
+}
+
+/**
+ * Get complete ballot consistency audit report (single read call).
+ */
+export async function sorobanGetAuditReport(
+  config: SorobanConfig,
+  ballotIdHash: string,
+): Promise<BallotAuditReport | null> {
+  const contractCheck = validateContractId(config.contractId);
+  if (!contractCheck.valid) return null;
+  const { value } = await readContract(config, "get_audit_report", [
+    { value: ballotIdHash, type: "string" },
+  ]);
+  return value as BallotAuditReport | null;
 }
 
 /**

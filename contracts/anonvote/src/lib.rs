@@ -81,6 +81,19 @@ pub struct BallotStateSnapshot {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BallotAuditReport {
+    pub admin: Address,
+    pub created_at: u64,
+    pub expiration_time: u64,
+    pub is_consistent: bool,
+    pub result_hash: Option<String>,
+    pub state: BallotState,
+    pub tokens_issued: u32,
+    pub votes_cast: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingUpgrade {
     pub executable_at: u64,
     pub new_wasm_hash: BytesN<32>,
@@ -669,6 +682,34 @@ impl AnonVoteContract {
         })
     }
 
+    pub fn get_audit_report(env: Env, ballot_id_hash: String) -> Option<BallotAuditReport> {
+        let metadata = Self::require_ballot_metadata(&env, &ballot_id_hash).ok()?;
+        let tokens: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TokensIssued(ballot_id_hash.clone()))
+            .unwrap_or(0);
+        let votes: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VotesCast(ballot_id_hash.clone()))
+            .unwrap_or(0);
+        let result_hash = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ResultHash(ballot_id_hash));
+        Some(BallotAuditReport {
+            admin: metadata.admin,
+            created_at: metadata.created_at,
+            expiration_time: metadata.expiration_time,
+            is_consistent: tokens == votes,
+            result_hash,
+            state: metadata.state,
+            tokens_issued: tokens,
+            votes_cast: votes,
+        })
+    }
+
     pub fn is_consistent(env: Env, ballot_id_hash: String) -> bool {
         let tokens: u32 = env
             .storage()
@@ -1011,5 +1052,55 @@ mod tests {
             client.try_record_token(&admin, &ballot),
             Err(Ok(ContractError::LimitExceeded))
         );
+    }
+
+    #[test]
+    fn ballot_audit_report_works() {
+        let (env, client, admin) = setup();
+        let ballot = String::from_str(&env, "audit-ballot");
+        
+        // Report for non-existent ballot should be None
+        assert_eq!(client.get_audit_report(&ballot), None);
+
+        // Record ballot
+        client.record_ballot(&admin, &ballot, &limits(10, 10));
+
+        // Get report
+        let report = client.get_audit_report(&ballot).unwrap();
+        assert_eq!(report.admin, admin);
+        assert_eq!(report.created_at, env.ledger().timestamp());
+        assert_eq!(report.expiration_time, 0);
+        assert!(report.is_consistent);
+        assert_eq!(report.result_hash, None);
+        assert_eq!(report.state, BallotState::Active);
+        assert_eq!(report.tokens_issued, 0);
+        assert_eq!(report.votes_cast, 0);
+
+        // Record tokens/votes and assert matches individual reads
+        client.record_token(&admin, &ballot);
+        client.record_vote(&admin, &ballot);
+        
+        let report2 = client.get_audit_report(&ballot).unwrap();
+        assert_eq!(report2.tokens_issued, client.get_tokens_issued(&ballot).unwrap());
+        assert_eq!(report2.votes_cast, client.get_votes_cast(&ballot).unwrap());
+        assert_eq!(report2.is_consistent, client.is_consistent(&ballot));
+        assert!(report2.is_consistent);
+
+        // Make inconsistent
+        client.record_token(&admin, &ballot);
+        let report3 = client.get_audit_report(&ballot).unwrap();
+        assert_eq!(report3.tokens_issued, 2);
+        assert_eq!(report3.votes_cast, 1);
+        assert_eq!(report3.is_consistent, client.is_consistent(&ballot));
+        assert!(!report3.is_consistent);
+
+        // Publish result
+        let result = String::from_str(&env, "election-result");
+        let operation_id = client.record_result(&admin, &ballot, &result);
+        client.approve_operation(&operation_id, &admin);
+
+        let report4 = client.get_audit_report(&ballot).unwrap();
+        assert_eq!(report4.state, BallotState::ResultPublished);
+        assert_eq!(report4.result_hash, Some(result));
     }
 }
