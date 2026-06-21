@@ -125,6 +125,25 @@ export class FakeLedger {
         return { ok: true, value: ballot.tokensIssued === ballot.votesCast };
       }
 
+      case "get_audit_report": {
+        const ballotIdHash = get(0) as string;
+        const ballot = this.ballots.get(ballotIdHash);
+        if (!ballot) return { ok: true, value: undefined }; // matches Option::None
+        return {
+          ok: true,
+          value: {
+            admin: ballot.admin,
+            created_at: 1718880000,
+            expiration_time: 0,
+            is_consistent: ballot.tokensIssued === ballot.votesCast,
+            result_hash: ballot.resultHash,
+            state: ballot.state,
+            tokens_issued: ballot.tokensIssued,
+            votes_cast: ballot.votesCast,
+          },
+        };
+      }
+
       default:
         throw new Error(`FakeLedger: unhandled method "${method}"`);
     }
