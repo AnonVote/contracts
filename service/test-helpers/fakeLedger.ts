@@ -23,6 +23,7 @@ interface MerkleProof {
 
 type FakeBallot = {
   admin: string;
+  createdAt: number;
   tokensIssued: number;
   votesCast: number;
   resultHash: string | null;
@@ -83,6 +84,7 @@ export class FakeLedger {
         }
         this.ballots.set(ballotIdHash, {
           admin: caller,
+          createdAt: this.timestamp,
           tokensIssued: 0,
           votesCast: 0,
           resultHash: null,
@@ -178,6 +180,12 @@ export class FakeLedger {
         const ballot = this.ballots.get(get(0) as string);
         if (!ballot) return { ok: true, value: true }; // 0 == 0, matches lib.rs default
         return { ok: true, value: ballot.tokensIssued === ballot.votesCast };
+      }
+
+      case "get_ballot_created_at": {
+        const ballot = this.ballots.get(get(0) as string);
+        // Matches Option<u64>::None when ballot doesn't exist
+        return { ok: true, value: ballot ? ballot.createdAt : undefined };
       }
 
       case "get_audit_report": {

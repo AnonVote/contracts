@@ -997,6 +997,31 @@ export async function sorobanGetBallotState(
 }
 
 /**
+ * Returns the ledger timestamp (Unix seconds) captured when the ballot was
+ * first recorded on-chain via record_ballot().
+ *
+ * The value is immutable — it is set exactly once and never updated by
+ * subsequent operations (token issuance, votes, result publication, etc.).
+ * Returns null if the ballot does not exist or the config / RPC call fails.
+ *
+ * Stellar block times are ~5-6 seconds, so timestamps have that granularity.
+ */
+export async function sorobanGetBallotCreatedAt(
+  config: SorobanConfig,
+  ballotIdHash: string,
+): Promise<number | null> {
+  const contractCheck = validateContractId(config.contractId);
+  if (!contractCheck.valid) return null;
+  const { value, errorCode } = await readContract(config, "get_ballot_created_at", [
+    { value: ballotIdHash, type: "string" },
+  ]);
+  if (errorCode !== undefined) return null;
+  // Contract returns Option<u64>: None → undefined/null, Some(ts) → number
+  if (value === null || value === undefined) return null;
+  return Number(value);
+}
+
+/**
  * Get complete ballot consistency audit report (single read call).
  */
 export async function sorobanGetAuditReport(

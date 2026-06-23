@@ -681,6 +681,17 @@ impl AnonVoteContract {
             .get(&DataKey::BallotMetadata(ballot_id_hash))
     }
 
+    /// Returns the ledger timestamp captured when the ballot was first recorded.
+    /// Returns None if the ballot does not exist.
+    /// The value is immutable — it is set once in record_ballot and never updated.
+    pub fn get_ballot_created_at(env: Env, ballot_id_hash: String) -> Option<u64> {
+        let metadata: BallotMetadata = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BallotMetadata(ballot_id_hash))?;
+        Some(metadata.created_at)
+    }
+
     pub fn get_ballot_state(env: Env, ballot_id_hash: String) -> Option<BallotStateSnapshot> {
         let metadata = Self::require_ballot_metadata(&env, &ballot_id_hash).ok()?;
         Some(BallotStateSnapshot {
@@ -1375,5 +1386,79 @@ mod tests {
         let non_existent_ballot = String::from_str(&env, "non-existent-ballot");
         let res = client.try_verify_result_proof(&non_existent_ballot, &proof0, &root_hex);
         assert_eq!(res, Err(Ok(ContractError::BallotNotFound)));
+    }
+
+    #[test]
+    fn get_ballot_created_at_returns_timestamp_set_at_creation() {
+        let (env, client, admin) = setup();
+        let ballot = String::from_str(&env, "ts-ballot");
+
+        // Before creation: returns None
+        assert_eq!(client.get_ballot_created_at(&ballot), None);
+
+        // Record at a known timestamp
+        let creation_time = env.ledger().timestamp();
+        client.record_ballot(&admin, &ballot, &limits(10, 10));
+
+        // After creation: returns the ledger timestamp at creation
+        assert_eq!(client.get_ballot_created_at(&ballot), Some(creation_time));
+    }
+
+    #[test]
+    fn get_ballot_created_at_is_immutable_after_state_changes() {
+        let (env, client, admin) = setup();
+        let ballot = String::from_str(&env, "immutable-ts-ballot");
+
+        client.record_ballot(&admin, &ballot, &limits(10, 10));
+        let creation_time = client.get_ballot_created_at(&ballot).unwrap();
+
+        // Advance ledger time, record tokens and votes
+        env.ledger().with_mut(|l| l.timestamp += 100);
+        client.record_token(&admin, &ballot);
+        client.record_vote(&admin, &ballot);
+
+        // Timestamp must not change
+        assert_eq!(client.get_ballot_created_at(&ballot), Some(creation_time));
+
+        // Advance again and publish result; timestamp still unchanged
+        env.ledger().with_mut(|l| l.timestamp += 100);
+        let result = String::from_str(&env, "result-hash");
+        let op_id = client.record_result(&admin, &ballot, &result);
+        client.approve_operation(&op_id, &admin);
+
+        assert_eq!(client.get_ballot_created_at(&ballot), Some(creation_time));
+    }
+
+    #[test]
+    fn get_ballot_created_at_matches_metadata_and_audit_report() {
+        let (env, client, admin) = setup();
+        let ballot = String::from_str(&env, "cross-check-ballot");
+
+        client.record_ballot(&admin, &ballot, &limits(10, 10));
+
+        let created_at = client.get_ballot_created_at(&ballot).unwrap();
+        let metadata   = client.get_ballot_metadata(&ballot).unwrap();
+        let report     = client.get_audit_report(&ballot).unwrap();
+
+        assert_eq!(created_at, metadata.created_at);
+        assert_eq!(created_at, report.created_at);
+    }
+
+    #[test]
+    fn ballots_created_at_different_ledger_times_have_distinct_timestamps() {
+        let (env, client, admin) = setup();
+        let ballot_a = String::from_str(&env, "ballot-a");
+        let ballot_b = String::from_str(&env, "ballot-b");
+
+        client.record_ballot(&admin, &ballot_a, &limits(10, 10));
+        let ts_a = client.get_ballot_created_at(&ballot_a).unwrap();
+
+        // Advance ledger time before creating second ballot
+        env.ledger().with_mut(|l| l.timestamp += 60);
+        client.record_ballot(&admin, &ballot_b, &limits(10, 10));
+        let ts_b = client.get_ballot_created_at(&ballot_b).unwrap();
+
+        assert!(ts_b > ts_a);
+        assert_eq!(ts_b - ts_a, 60);
     }
 }
