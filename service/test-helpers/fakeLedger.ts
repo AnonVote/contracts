@@ -23,6 +23,7 @@ interface MerkleProof {
 
 type FakeBallot = {
   admin: string;
+  createdAt: number;
   tokensIssued: number;
   votesCast: number;
   resultHash: string | null;
@@ -41,8 +42,15 @@ const ContractErrorCode = {
   InvalidStateTransition: 12,
 };
 
+const FAKE_LEDGER_TIMESTAMP = 1718880000;
+
 export class FakeLedger {
   private ballots = new Map<string, FakeBallot>();
+  private timestamp: number = FAKE_LEDGER_TIMESTAMP;
+
+  advanceTime(seconds: number) {
+    this.timestamp += seconds;
+  }
 
   call(method: string, args: { value: unknown }[]): LedgerOutcome {
     const get = (i: number) => args[i]?.value;
@@ -58,6 +66,7 @@ export class FakeLedger {
         }
         this.ballots.set(ballotIdHash, {
           admin: caller,
+          createdAt: this.timestamp,
           tokensIssued: 0,
           votesCast: 0,
           resultHash: null,
@@ -133,6 +142,12 @@ export class FakeLedger {
         return { ok: true, value: ballot.tokensIssued === ballot.votesCast };
       }
 
+      case "get_ballot_created_at": {
+        const ballot = this.ballots.get(get(0) as string);
+        // Matches Option<u64>::None when ballot doesn't exist
+        return { ok: true, value: ballot ? ballot.createdAt : undefined };
+      }
+
       case "get_audit_report": {
         const ballotIdHash = get(0) as string;
         const ballot = this.ballots.get(ballotIdHash);
@@ -141,7 +156,7 @@ export class FakeLedger {
           ok: true,
           value: {
             admin: ballot.admin,
-            created_at: 1718880000,
+            created_at: ballot.createdAt,
             expiration_time: 0,
             is_consistent: ballot.tokensIssued === ballot.votesCast,
             result_hash: ballot.resultHash,
@@ -196,5 +211,6 @@ export class FakeLedger {
 
   reset() {
     this.ballots.clear();
+    this.timestamp = FAKE_LEDGER_TIMESTAMP;
   }
 }

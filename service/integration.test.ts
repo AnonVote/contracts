@@ -17,6 +17,7 @@ import {
   sorobanResultExists,
   sorobanGetAuditReport,
   sorobanVerifyResultProof,
+  sorobanGetBallotCreatedAt,
   SorobanErrorCode,
   type SorobanConfig,
 } from "./sorobanService";
@@ -303,5 +304,78 @@ describe("AnonVote ballot lifecycle (mocked contract, no live network)", () => {
     // 9. Verify with incorrect root parameter
     const verifyWrongRoot = await sorobanVerifyResultProof(config, ballotIdHash, proof0, "wrong-root-hex");
     expect(verifyWrongRoot).toBe(false);
+  });
+});
+
+describe("Ballot creation timestamp (Issue #12)", () => {
+  it("returns the ledger timestamp captured at record_ballot time", async () => {
+    const config = makeConfig();
+    const ballotIdHash = "ballot-ts-int-001";
+
+    await sorobanRecordBallot(config, ballotIdHash);
+
+    const createdAt = await sorobanGetBallotCreatedAt(config, ballotIdHash);
+    expect(createdAt).toBe(1718880000); // FakeLedger.FAKE_LEDGER_TIMESTAMP
+  });
+
+  it("returns null for a ballot that has never been recorded", async () => {
+    const config = makeConfig();
+    const createdAt = await sorobanGetBallotCreatedAt(config, "never-created");
+    expect(createdAt).toBeNull();
+  });
+
+  it("timestamp is immutable after tokens, votes, and result publication", async () => {
+    const config = makeConfig();
+    const ballotIdHash = "ballot-ts-int-002";
+
+    await sorobanRecordBallot(config, ballotIdHash);
+    const createdAt = await sorobanGetBallotCreatedAt(config, ballotIdHash);
+    expect(createdAt).not.toBeNull();
+
+    // Mutating operations must not affect created_at
+    await sorobanRecordToken(config, ballotIdHash);
+    await sorobanRecordVote(config, ballotIdHash);
+    await sorobanRecordResult(config, ballotIdHash, "result-hash-ts");
+
+    const createdAtAfter = await sorobanGetBallotCreatedAt(config, ballotIdHash);
+    expect(createdAtAfter).toBe(createdAt);
+  });
+
+  it("created_at matches the value in audit report and audit counts", async () => {
+    const config = makeConfig();
+    const ballotIdHash = "ballot-ts-int-003";
+
+    await sorobanRecordBallot(config, ballotIdHash);
+
+    const createdAt = await sorobanGetBallotCreatedAt(config, ballotIdHash);
+    const report    = await sorobanGetAuditReport(config, ballotIdHash);
+
+    expect(createdAt).not.toBeNull();
+    expect(report).not.toBeNull();
+    expect(createdAt).toBe(report!.created_at);
+  });
+
+  it("two ballots created at different ledger times have distinct timestamps", async () => {
+    const config = makeConfig();
+
+    await sorobanRecordBallot(config, "ballot-ts-int-004a");
+    const tsA = await sorobanGetBallotCreatedAt(config, "ballot-ts-int-004a");
+
+    // Advance FakeLedger time before creating second ballot
+    ledger.advanceTime(60);
+    await sorobanRecordBallot(config, "ballot-ts-int-004b");
+    const tsB = await sorobanGetBallotCreatedAt(config, "ballot-ts-int-004b");
+
+    expect(tsA).not.toBeNull();
+    expect(tsB).not.toBeNull();
+    expect(tsB!).toBeGreaterThan(tsA!);
+    expect(tsB! - tsA!).toBe(60);
+  });
+
+  it("returns null for invalid contract ID without calling RPC", async () => {
+    const badConfig = { ...makeConfig(), contractId: "not-a-contract" };
+    const result = await sorobanGetBallotCreatedAt(badConfig, "any-ballot");
+    expect(result).toBeNull();
+    expect(mockRpc.simulateTransaction).not.toHaveBeenCalled();
   });
 });

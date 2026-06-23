@@ -23,6 +23,9 @@ import {
   sorobanRecordResult,
   sorobanResultExists,
   sorobanVerifyResultProof,
+  sorobanRotateAdmin,
+  sorobanGetRotationHistory,
+  sorobanGetBallotCreatedAt,
   SorobanErrorCode,
   DEFAULT_RETRY_POLICY,
   type SorobanConfig,
@@ -295,5 +298,41 @@ describe("sorobanVerifyResultProof", () => {
     mockRpc.simulateTransaction.mockResolvedValueOnce(simulationError("Error(Contract, #4)"));
     const result = await sorobanVerifyResultProof(makeConfig(), "ballot-1", dummyProof, "result-hash");
     expect(result).toBeNull();
+  });
+});
+
+describe("sorobanGetBallotCreatedAt — unit tests (mocked RPC)", () => {
+  it("returns the timestamp when the contract returns a value", async () => {
+    mockRpc.simulateTransaction.mockResolvedValueOnce(simulationSuccess(1718880000));
+    const result = await sorobanGetBallotCreatedAt(makeConfig(), "ballot-ts-1");
+    expect(result).toBe(1718880000);
+  });
+
+  it("returns null when the ballot does not exist (contract returns None / undefined)", async () => {
+    mockRpc.simulateTransaction.mockResolvedValueOnce(simulationSuccess(undefined));
+    const result = await sorobanGetBallotCreatedAt(makeConfig(), "missing-ballot");
+    expect(result).toBeNull();
+  });
+
+  it("returns null for an invalid contract ID without calling RPC", async () => {
+    const result = await sorobanGetBallotCreatedAt(
+      makeConfig({ contractId: "not-a-contract" }),
+      "ballot-ts-2",
+    );
+    expect(result).toBeNull();
+    expect(mockRpc.simulateTransaction).not.toHaveBeenCalled();
+  });
+
+  it("returns null when the RPC simulation fails", async () => {
+    mockRpc.simulateTransaction.mockResolvedValueOnce(simulationError("Error(Contract, #4)"));
+    const result = await sorobanGetBallotCreatedAt(makeConfig(), "ballot-ts-3");
+    expect(result).toBeNull();
+  });
+
+  it("coerces a bigint-like value returned by scValToNative to a number", async () => {
+    // Soroban u64 values may be deserialized as BigInt by stellar-sdk
+    mockRpc.simulateTransaction.mockResolvedValueOnce(simulationSuccess(BigInt(1718880042)));
+    const result = await sorobanGetBallotCreatedAt(makeConfig(), "ballot-ts-4");
+    expect(result).toBe(1718880042);
   });
 });
