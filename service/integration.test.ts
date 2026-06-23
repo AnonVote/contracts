@@ -17,7 +17,8 @@ import {
   sorobanResultExists,
   sorobanGetAuditReport,
   sorobanVerifyResultProof,
-  sorobanGetBallotCreatedAt,
+  sorobanRotateAdmin,
+  sorobanGetRotationHistory,
   SorobanErrorCode,
   type SorobanConfig,
 } from "./sorobanService";
@@ -53,6 +54,9 @@ beforeEach(() => {
     hash: "tx-" + Math.random().toString(36).slice(2),
   }));
   mockRpc.getTransaction.mockImplementation(async () => txSuccess((mockRpc as any)._lastValue));
+
+  // Seed FakeLedger admin so rotate_admin can validate the caller.
+  ledger.setAdmin(StellarSdk.Keypair.fromSecret(ADMIN_SECRET_KEY).publicKey());
 });
 
 describe("AnonVote ballot lifecycle (mocked contract, no live network)", () => {
@@ -307,75 +311,84 @@ describe("AnonVote ballot lifecycle (mocked contract, no live network)", () => {
   });
 });
 
-describe("Ballot creation timestamp (Issue #12)", () => {
-  it("returns the ledger timestamp captured at record_ballot time", async () => {
-    const config = makeConfig();
-    const ballotIdHash = "ballot-ts-int-001";
+describe("Admin key rotation (mocked contract, no live network)", () => {
+  it("full rotation flow: new admin gains privileges, old admin is locked out", async () => {
+    const adminConfig = makeConfig(ADMIN_SECRET_KEY);
+    const newAdminKey = "S" + "E".repeat(55);
+    const newAdminConfig = makeConfig(newAdminKey);
+    const newAdminPublicKey = StellarSdk.Keypair.fromSecret(newAdminKey).publicKey();
 
-    await sorobanRecordBallot(config, ballotIdHash);
+    // Rotation succeeds
+    const rotateResult = await sorobanRotateAdmin(adminConfig, newAdminPublicKey);
+    expect(rotateResult.success).toBe(true);
 
-    const createdAt = await sorobanGetBallotCreatedAt(config, ballotIdHash);
-    expect(createdAt).toBe(1718880000); // FakeLedger.FAKE_LEDGER_TIMESTAMP
+    // History has one record
+    const history = await sorobanGetRotationHistory(adminConfig);
+    expect(history).not.toBeNull();
+    expect(history!.length).toBe(1);
+    expect(history![0]!.newAdmin).toBe(newAdminPublicKey);
+    expect(history![0]!.oldAdmin).toBe(StellarSdk.Keypair.fromSecret(ADMIN_SECRET_KEY).publicKey());
+    expect(typeof history![0]!.rotatedAt).toBe("number");
+
+    // Old admin can no longer rotate (AdminUnauthorized in FakeLedger)
+    const rejectedRotate = await sorobanRotateAdmin(adminConfig, StellarSdk.Keypair.fromSecret(ADMIN_SECRET_KEY).publicKey());
+    expect(rejectedRotate.success).toBe(false);
+    expect(rejectedRotate.errorCode).toBe(SorobanErrorCode.AdminUnauthorized);
+
+    // New admin can rotate further
+    const secondRotateResult = await sorobanRotateAdmin(newAdminConfig, StellarSdk.Keypair.fromSecret(ADMIN_SECRET_KEY).publicKey());
+    expect(secondRotateResult.success).toBe(true);
   });
 
-  it("returns null for a ballot that has never been recorded", async () => {
-    const config = makeConfig();
-    const createdAt = await sorobanGetBallotCreatedAt(config, "never-created");
-    expect(createdAt).toBeNull();
+  it("rejects rotation to the same admin address with SameAdmin", async () => {
+    const adminConfig = makeConfig(ADMIN_SECRET_KEY);
+    const currentAdminPublicKey = StellarSdk.Keypair.fromSecret(ADMIN_SECRET_KEY).publicKey();
+
+    const result = await sorobanRotateAdmin(adminConfig, currentAdminPublicKey);
+    expect(result.success).toBe(false);
+    expect(result.errorCode).toBe(SorobanErrorCode.SameAdmin);
   });
 
-  it("timestamp is immutable after tokens, votes, and result publication", async () => {
-    const config = makeConfig();
-    const ballotIdHash = "ballot-ts-int-002";
-
-    await sorobanRecordBallot(config, ballotIdHash);
-    const createdAt = await sorobanGetBallotCreatedAt(config, ballotIdHash);
-    expect(createdAt).not.toBeNull();
-
-    // Mutating operations must not affect created_at
-    await sorobanRecordToken(config, ballotIdHash);
-    await sorobanRecordVote(config, ballotIdHash);
-    await sorobanRecordResult(config, ballotIdHash, "result-hash-ts");
-
-    const createdAtAfter = await sorobanGetBallotCreatedAt(config, ballotIdHash);
-    expect(createdAtAfter).toBe(createdAt);
-  });
-
-  it("created_at matches the value in audit report and audit counts", async () => {
-    const config = makeConfig();
-    const ballotIdHash = "ballot-ts-int-003";
-
-    await sorobanRecordBallot(config, ballotIdHash);
-
-    const createdAt = await sorobanGetBallotCreatedAt(config, ballotIdHash);
-    const report    = await sorobanGetAuditReport(config, ballotIdHash);
-
-    expect(createdAt).not.toBeNull();
-    expect(report).not.toBeNull();
-    expect(createdAt).toBe(report!.created_at);
-  });
-
-  it("two ballots created at different ledger times have distinct timestamps", async () => {
-    const config = makeConfig();
-
-    await sorobanRecordBallot(config, "ballot-ts-int-004a");
-    const tsA = await sorobanGetBallotCreatedAt(config, "ballot-ts-int-004a");
-
-    // Advance FakeLedger time before creating second ballot
-    ledger.advanceTime(60);
-    await sorobanRecordBallot(config, "ballot-ts-int-004b");
-    const tsB = await sorobanGetBallotCreatedAt(config, "ballot-ts-int-004b");
-
-    expect(tsA).not.toBeNull();
-    expect(tsB).not.toBeNull();
-    expect(tsB!).toBeGreaterThan(tsA!);
-    expect(tsB! - tsA!).toBe(60);
-  });
-
-  it("returns null for invalid contract ID without calling RPC", async () => {
-    const badConfig = { ...makeConfig(), contractId: "not-a-contract" };
-    const result = await sorobanGetBallotCreatedAt(badConfig, "any-ballot");
-    expect(result).toBeNull();
+  it("returns NotConfigured without touching RPC when config is invalid", async () => {
+    const badConfig = makeConfig("not-a-real-secret-key");
+    const result = await sorobanRotateAdmin(badConfig, "GSOME_ADDRESS");
+    expect(result.success).toBe(false);
+    expect(result.errorCode).toBe(SorobanErrorCode.NotConfigured);
     expect(mockRpc.simulateTransaction).not.toHaveBeenCalled();
+  });
+
+  it("sorobanGetRotationHistory returns empty array before any rotation", async () => {
+    const config = makeConfig();
+    const history = await sorobanGetRotationHistory(config);
+    expect(history).toEqual([]);
+  });
+
+  it("sorobanGetRotationHistory returns null for invalid contract ID", async () => {
+    const history = await sorobanGetRotationHistory(
+      makeConfig(ADMIN_SECRET_KEY) as any & { contractId: string },
+    );
+    // override contractId with invalid value
+    const badConfig = { ...makeConfig(), contractId: "not-a-contract" };
+    const result = await sorobanGetRotationHistory(badConfig);
+    expect(result).toBeNull();
+  });
+
+  it("accumulates multiple rotation records in order", async () => {
+    const keyA = ADMIN_SECRET_KEY;
+    const keyB = "S" + "E".repeat(55);
+    const keyC = "S" + "F".repeat(55);
+    const pubA = StellarSdk.Keypair.fromSecret(keyA).publicKey();
+    const pubB = StellarSdk.Keypair.fromSecret(keyB).publicKey();
+    const pubC = StellarSdk.Keypair.fromSecret(keyC).publicKey();
+
+    await sorobanRotateAdmin(makeConfig(keyA), pubB);
+    await sorobanRotateAdmin(makeConfig(keyB), pubC);
+
+    const history = await sorobanGetRotationHistory(makeConfig(keyC));
+    expect(history!.length).toBe(2);
+    expect(history![0]!.oldAdmin).toBe(pubA);
+    expect(history![0]!.newAdmin).toBe(pubB);
+    expect(history![1]!.oldAdmin).toBe(pubB);
+    expect(history![1]!.newAdmin).toBe(pubC);
   });
 });

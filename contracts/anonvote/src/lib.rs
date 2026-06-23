@@ -38,6 +38,7 @@ pub enum ContractError {
     OperationAlreadyApproved = 19,
     OperationNotPending = 20,
     OperationExpired = 21,
+    SameAdmin = 22,
 }
 
 #[contracttype]
@@ -108,6 +109,14 @@ pub struct PendingUpgrade {
     pub scheduled_at: u64,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RotationRecord {
+    pub old_admin: Address,
+    pub new_admin: Address,
+    pub rotated_at: u64,
+}
+
 /// Operations that must be approved by the configured M-of-N approvers.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -157,6 +166,7 @@ pub enum DataKey {
     BallotMetadata(String),
     BallotExpired(String),
     PendingUpgrade,
+    RotationHistory,
 }
 
 #[contract]
@@ -618,6 +628,13 @@ impl AnonVoteContract {
         env.storage().instance().get(&DataKey::PendingUpgrade)
     }
 
+    pub fn get_rotation_history(env: Env) -> Vec<RotationRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RotationHistory)
+            .unwrap_or(Vec::new(&env))
+    }
+
     pub fn get_tokens_issued(env: Env, ballot_id_hash: String) -> Option<u32> {
         if !Self::ballot_exists(env.clone(), ballot_id_hash.clone()) {
             return None;
@@ -806,7 +823,17 @@ impl AnonVoteContract {
                     return Err(ContractError::UpgradeAlreadyScheduled);
                 }
             }
-            CriticalOperation::AdminRotation(_) | CriticalOperation::Pause => {}
+            CriticalOperation::AdminRotation(new_admin) => {
+                let current_admin: Address = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Admin)
+                    .ok_or(ContractError::NotInitialized)?;
+                if current_admin == *new_admin {
+                    return Err(ContractError::SameAdmin);
+                }
+            }
+            CriticalOperation::Pause => {}
         }
         Ok(())
     }
@@ -819,10 +846,30 @@ impl AnonVoteContract {
                     .instance()
                     .get(&DataKey::Admin)
                     .ok_or(ContractError::NotInitialized)?;
+                if old_admin == *new_admin {
+                    return Err(ContractError::SameAdmin);
+                }
+                let rotated_at = env.ledger().timestamp();
                 env.storage().instance().set(&DataKey::Admin, new_admin);
+
+                // Append to rotation history stored in persistent storage.
+                let mut history: Vec<RotationRecord> = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::RotationHistory)
+                    .unwrap_or(Vec::new(env));
+                history.push_back(RotationRecord {
+                    old_admin: old_admin.clone(),
+                    new_admin: new_admin.clone(),
+                    rotated_at,
+                });
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::RotationHistory, &history);
+
                 env.events().publish(
-                    (symbol_short!("audit"), symbol_short!("adm_rotd")),
-                    (old_admin, new_admin.clone()),
+                    (symbol_short!("admin"), symbol_short!("rotated")),
+                    (old_admin, new_admin.clone(), rotated_at),
                 );
             }
             CriticalOperation::ResultPublication(ballot_id_hash, result_hash) => {
@@ -1109,6 +1156,81 @@ mod tests {
             upgrade.executable_at,
             upgrade.scheduled_at + UPGRADE_TIME_LOCK_SECONDS
         );
+    }
+
+    #[test]
+    fn admin_rotation_stores_history_and_emits_event() {
+        let (env, client, admin) = setup();
+        let new_admin = Address::generate(&env);
+
+        // Rotate via 1-of-1 (default threshold after initialize)
+        let op_id = client.rotate_admin(&admin, &new_admin);
+        client.approve_operation(&op_id, &admin);
+
+        // New admin is set
+        assert_eq!(client.get_admin(), Some(new_admin.clone()));
+
+        // Rotation history has one entry
+        let history = client.get_rotation_history();
+        assert_eq!(history.len(), 1);
+        let record = history.get(0).unwrap();
+        assert_eq!(record.old_admin, admin);
+        assert_eq!(record.new_admin, new_admin);
+        assert_eq!(record.rotated_at, env.ledger().timestamp());
+    }
+
+    #[test]
+    fn old_admin_loses_privileges_immediately_after_rotation() {
+        let (env, client, admin) = setup();
+        let new_admin = Address::generate(&env);
+
+        let op_id = client.rotate_admin(&admin, &new_admin);
+        client.approve_operation(&op_id, &admin);
+
+        // Old admin can no longer create operations
+        assert_eq!(
+            client.try_rotate_admin(&admin, &Address::generate(&env)),
+            Err(Ok(ContractError::AdminUnauthorized))
+        );
+
+        // New admin can create operations
+        let third = Address::generate(&env);
+        let op2 = client.rotate_admin(&new_admin, &third);
+        client.approve_operation(&op2, &new_admin);
+        assert_eq!(client.get_admin(), Some(third));
+    }
+
+    #[test]
+    fn rotation_to_same_admin_is_rejected() {
+        let (env, client, admin) = setup();
+
+        // validate_operation fires during create_operation, before any approval
+        assert_eq!(
+            client.try_rotate_admin(&admin, &admin),
+            Err(Ok(ContractError::SameAdmin))
+        );
+    }
+
+    #[test]
+    fn rotation_history_accumulates_multiple_records() {
+        let (env, client, admin) = setup();
+        let second = Address::generate(&env);
+        let third = Address::generate(&env);
+
+        let op1 = client.rotate_admin(&admin, &second);
+        client.approve_operation(&op1, &admin);
+
+        env.ledger().with_mut(|l| l.timestamp += 100);
+
+        let op2 = client.rotate_admin(&second, &third);
+        client.approve_operation(&op2, &second);
+
+        let history = client.get_rotation_history();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history.get(0).unwrap().new_admin, second);
+        assert_eq!(history.get(1).unwrap().new_admin, third);
+        // timestamps differ
+        assert!(history.get(1).unwrap().rotated_at > history.get(0).unwrap().rotated_at);
     }
 
     #[test]
