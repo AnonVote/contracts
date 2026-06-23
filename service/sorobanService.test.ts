@@ -23,6 +23,8 @@ import {
   sorobanRecordResult,
   sorobanResultExists,
   sorobanVerifyResultProof,
+  sorobanRotateAdmin,
+  sorobanGetRotationHistory,
   SorobanErrorCode,
   DEFAULT_RETRY_POLICY,
   type SorobanConfig,
@@ -294,6 +296,82 @@ describe("sorobanVerifyResultProof", () => {
   it("returns null when RPC simulation fails (e.g., BallotNotFound)", async () => {
     mockRpc.simulateTransaction.mockResolvedValueOnce(simulationError("Error(Contract, #4)"));
     const result = await sorobanVerifyResultProof(makeConfig(), "ballot-1", dummyProof, "result-hash");
+    expect(result).toBeNull();
+  });
+});
+
+describe("sorobanRotateAdmin — unit tests (mocked RPC)", () => {
+  it("returns success and a txHash when simulation and confirmation succeed", async () => {
+    mockRpc.simulateTransaction.mockResolvedValueOnce(simulationSuccess(0));
+    mockRpc.sendTransaction.mockResolvedValueOnce({ status: "PENDING", hash: "tx-rotate-1" });
+    mockRpc.getTransaction.mockResolvedValueOnce(txSuccess(0));
+
+    const result = await sorobanRotateAdmin(makeConfig(), "G" + "A".repeat(55));
+    expect(result.success).toBe(true);
+    expect(result.txHash).toBe("tx-rotate-1");
+  });
+
+  it("returns SameAdmin error when contract rejects same-address rotation", async () => {
+    mockRpc.simulateTransaction.mockResolvedValueOnce(simulationError("Error(Contract, #22)"));
+
+    const result = await sorobanRotateAdmin(makeConfig(), "G" + "A".repeat(55));
+    expect(result.success).toBe(false);
+    expect(result.errorCode).toBe(SorobanErrorCode.SameAdmin);
+    expect(result.errorMessage).toBe("New admin must be different from the current admin");
+    expect(mockRpc.sendTransaction).not.toHaveBeenCalled();
+  });
+
+  it("returns AdminUnauthorized when caller is not the current admin", async () => {
+    mockRpc.simulateTransaction.mockResolvedValueOnce(simulationError("Error(Contract, #1)"));
+
+    const result = await sorobanRotateAdmin(makeConfig(), "G" + "B".repeat(55));
+    expect(result.success).toBe(false);
+    expect(result.errorCode).toBe(SorobanErrorCode.AdminUnauthorized);
+    expect(mockRpc.sendTransaction).not.toHaveBeenCalled();
+  });
+
+  it("returns NotConfigured without calling RPC when secret key is invalid", async () => {
+    const result = await sorobanRotateAdmin(
+      makeConfig({ stellarSecretKey: "not-a-valid-key" }),
+      "G" + "A".repeat(55),
+    );
+    expect(result.success).toBe(false);
+    expect(result.errorCode).toBe(SorobanErrorCode.NotConfigured);
+    expect(mockRpc.simulateTransaction).not.toHaveBeenCalled();
+  });
+});
+
+describe("sorobanGetRotationHistory — unit tests (mocked RPC)", () => {
+  it("returns an empty array when no rotations have occurred", async () => {
+    mockRpc.simulateTransaction.mockResolvedValueOnce(simulationSuccess([]));
+
+    const history = await sorobanGetRotationHistory(makeConfig());
+    expect(history).toEqual([]);
+  });
+
+  it("maps contract field names to camelCase and returns records in order", async () => {
+    const raw = [
+      { old_admin: "GOLD1", new_admin: "GNEW1", rotated_at: 1000 },
+      { old_admin: "GNEW1", new_admin: "GNEW2", rotated_at: 2000 },
+    ];
+    mockRpc.simulateTransaction.mockResolvedValueOnce(simulationSuccess(raw));
+
+    const history = await sorobanGetRotationHistory(makeConfig());
+    expect(history).toEqual([
+      { oldAdmin: "GOLD1", newAdmin: "GNEW1", rotatedAt: 1000 },
+      { oldAdmin: "GNEW1", newAdmin: "GNEW2", rotatedAt: 2000 },
+    ]);
+  });
+
+  it("returns null when the contract ID is invalid", async () => {
+    const result = await sorobanGetRotationHistory(makeConfig({ contractId: "bad-id" }));
+    expect(result).toBeNull();
+    expect(mockRpc.simulateTransaction).not.toHaveBeenCalled();
+  });
+
+  it("returns null when the RPC call fails", async () => {
+    mockRpc.simulateTransaction.mockResolvedValueOnce(simulationError("Error(Contract, #3)"));
+    const result = await sorobanGetRotationHistory(makeConfig());
     expect(result).toBeNull();
   });
 });

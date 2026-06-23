@@ -39,6 +39,17 @@ export enum SorobanErrorCode {
   NoUpgradeScheduled    = 10,
   TimeLockNotExpired      = 11,
   InvalidStateTransition  = 12,
+  BallotExpired           = 13,
+  ContractPaused          = 14,
+  LimitExceeded           = 15,
+  InvalidApprovalConfig   = 16,
+  DuplicateApprover       = 17,
+  ApproverUnauthorized    = 18,
+  OperationNotFound       = 19,
+  OperationAlreadyApproved = 20,
+  OperationNotPending     = 21,
+  OperationExpired        = 22,
+  SameAdmin               = 23,
   // Non-contract errors
   SimulationFailed       = 100,
   TransactionFailed      = 101,
@@ -59,6 +70,17 @@ const ERROR_MESSAGES: Record<SorobanErrorCode, string> = {
   [SorobanErrorCode.NoUpgradeScheduled]:    "No upgrade is currently scheduled",
   [SorobanErrorCode.TimeLockNotExpired]:      "Time lock has not yet expired for the scheduled upgrade",
   [SorobanErrorCode.InvalidStateTransition]: "Invalid state transition — only Active→ResultPublished→Archived is allowed",
+  [SorobanErrorCode.BallotExpired]:          "Ballot has expired",
+  [SorobanErrorCode.ContractPaused]:         "Contract is currently paused",
+  [SorobanErrorCode.LimitExceeded]:          "Ballot token or vote limit exceeded",
+  [SorobanErrorCode.InvalidApprovalConfig]:  "Invalid M-of-N approval configuration",
+  [SorobanErrorCode.DuplicateApprover]:      "Duplicate address in approver list",
+  [SorobanErrorCode.ApproverUnauthorized]:   "Caller is not a configured approver for this operation",
+  [SorobanErrorCode.OperationNotFound]:      "Operation not found",
+  [SorobanErrorCode.OperationAlreadyApproved]: "Approver has already approved this operation",
+  [SorobanErrorCode.OperationNotPending]:    "Operation is not in pending status",
+  [SorobanErrorCode.OperationExpired]:       "Operation approval window has expired",
+  [SorobanErrorCode.SameAdmin]:              "New admin must be different from the current admin",
   [SorobanErrorCode.SimulationFailed]:       "Transaction simulation failed",
   [SorobanErrorCode.TransactionFailed]:      "Transaction submission failed",
   [SorobanErrorCode.NetworkError]:           "Network or RPC error",
@@ -270,6 +292,7 @@ const EVENT_SYMBOL_TO_TYPE: Record<string, SorobanAuditEventType> = {
   cnt_ovflw: "counter_overflow",
   counter_overflow: "counter_overflow",
   adm_rotd: "admin_rotated",
+  rotated: "admin_rotated",
   admin_rotated: "admin_rotated",
   upg_schd: "upgrade_scheduled",
   upgrade_scheduled: "upgrade_scheduled",
@@ -287,7 +310,7 @@ const EVENT_TYPE_TO_SYMBOL: Record<SorobanAuditEventType, string> = {
   vote_cast: "vote_cast",
   result_published: "res_pub",
   counter_overflow: "cnt_ovflw",
-  admin_rotated: "adm_rotd",
+  admin_rotated: "rotated",
   upgrade_scheduled: "upg_schd",
   upgrade_canceled: "upg_cncl",
   upgrade_executed: "upg_excd",
@@ -331,9 +354,12 @@ function getEventValue(event: any): unknown {
 }
 
 function getEventTypeFromTopics(topics: unknown[]): SorobanAuditEventType | string {
+  // Filter out known namespace prefixes ("audit", "govern", "admin") then
+  // look up the remaining topic symbol in the event type map.
+  const NAMESPACE_PREFIXES = new Set(["audit", "govern", "admin"]);
   const eventTopic = topics.find((topic) => {
     const value = String(topic ?? "");
-    return value !== "audit" && EVENT_SYMBOL_TO_TYPE[value] !== undefined;
+    return !NAMESPACE_PREFIXES.has(value) && EVENT_SYMBOL_TO_TYPE[value] !== undefined;
   });
   return normalizeEventType(eventTopic ?? "");
 }
@@ -383,6 +409,7 @@ export function parseSorobanEvent(event: unknown): SorobanEventData {
     case "admin_rotated":
       parsed.previousAdmin = tuple[0] !== undefined ? String(tuple[0]) : undefined;
       parsed.newAdmin = tuple[1] !== undefined ? String(tuple[1]) : undefined;
+      parsed.transitionedAt = tuple[2] !== undefined ? Number(tuple[2]) : undefined;
       break;
     case "upgrade_scheduled":
       parsed.admin = tuple[0] !== undefined ? String(tuple[0]) : undefined;
@@ -828,9 +855,9 @@ export async function sorobanRecordResult(
 }
 
 /**
- * Rotate the contract admin to a new address.
- * Must be called by the current admin.
- * Returns the full SorobanInvokeResult — see sorobanRecordBallot doc.
+ * Rotate the contract admin via M-of-N governance (creates a pending operation).
+ * Must be called by the current admin. Rejects if new_admin equals current admin (SameAdmin).
+ * Returns the operation ID wrapped in SorobanInvokeResult.returnValue on success.
  */
 export async function sorobanRotateAdmin(
   config: SorobanConfig,
@@ -852,6 +879,27 @@ export async function sorobanRotateAdmin(
     );
   }
   return result;
+}
+
+/**
+ * Read the on-chain admin rotation history (view call — no transaction).
+ * Returns records in chronological order (oldest first).
+ * Returns null if config is invalid or the query fails.
+ */
+export async function sorobanGetRotationHistory(
+  config: SorobanConfig,
+): Promise<Array<{ oldAdmin: string; newAdmin: string; rotatedAt: number }> | null> {
+  const contractCheck = validateContractId(config.contractId);
+  if (!contractCheck.valid) return null;
+  const { value, errorCode } = await readContract(config, "get_rotation_history", []);
+  if (errorCode !== undefined) return null;
+  const raw = value as Array<{ old_admin: string; new_admin: string; rotated_at: number }> | null;
+  if (!Array.isArray(raw)) return [];
+  return raw.map((r) => ({
+    oldAdmin: String(r.old_admin ?? ""),
+    newAdmin: String(r.new_admin ?? ""),
+    rotatedAt: Number(r.rotated_at ?? 0),
+  }));
 }
 
 /**
