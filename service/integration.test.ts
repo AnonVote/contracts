@@ -17,6 +17,8 @@ import {
   sorobanResultExists,
   sorobanGetAuditReport,
   sorobanVerifyResultProof,
+  sorobanRotateAdmin,
+  sorobanGetRotationHistory,
   SorobanErrorCode,
   type SorobanConfig,
 } from "./sorobanService";
@@ -52,6 +54,9 @@ beforeEach(() => {
     hash: "tx-" + Math.random().toString(36).slice(2),
   }));
   mockRpc.getTransaction.mockImplementation(async () => txSuccess((mockRpc as any)._lastValue));
+
+  // Seed FakeLedger admin so rotate_admin can validate the caller.
+  ledger.setAdmin(StellarSdk.Keypair.fromSecret(ADMIN_SECRET_KEY).publicKey());
 });
 
 describe("AnonVote ballot lifecycle (mocked contract, no live network)", () => {
@@ -303,5 +308,87 @@ describe("AnonVote ballot lifecycle (mocked contract, no live network)", () => {
     // 9. Verify with incorrect root parameter
     const verifyWrongRoot = await sorobanVerifyResultProof(config, ballotIdHash, proof0, "wrong-root-hex");
     expect(verifyWrongRoot).toBe(false);
+  });
+});
+
+describe("Admin key rotation (mocked contract, no live network)", () => {
+  it("full rotation flow: new admin gains privileges, old admin is locked out", async () => {
+    const adminConfig = makeConfig(ADMIN_SECRET_KEY);
+    const newAdminKey = "S" + "E".repeat(55);
+    const newAdminConfig = makeConfig(newAdminKey);
+    const newAdminPublicKey = StellarSdk.Keypair.fromSecret(newAdminKey).publicKey();
+
+    // Rotation succeeds
+    const rotateResult = await sorobanRotateAdmin(adminConfig, newAdminPublicKey);
+    expect(rotateResult.success).toBe(true);
+
+    // History has one record
+    const history = await sorobanGetRotationHistory(adminConfig);
+    expect(history).not.toBeNull();
+    expect(history!.length).toBe(1);
+    expect(history![0]!.newAdmin).toBe(newAdminPublicKey);
+    expect(history![0]!.oldAdmin).toBe(StellarSdk.Keypair.fromSecret(ADMIN_SECRET_KEY).publicKey());
+    expect(typeof history![0]!.rotatedAt).toBe("number");
+
+    // Old admin can no longer rotate (AdminUnauthorized in FakeLedger)
+    const rejectedRotate = await sorobanRotateAdmin(adminConfig, StellarSdk.Keypair.fromSecret(ADMIN_SECRET_KEY).publicKey());
+    expect(rejectedRotate.success).toBe(false);
+    expect(rejectedRotate.errorCode).toBe(SorobanErrorCode.AdminUnauthorized);
+
+    // New admin can rotate further
+    const secondRotateResult = await sorobanRotateAdmin(newAdminConfig, StellarSdk.Keypair.fromSecret(ADMIN_SECRET_KEY).publicKey());
+    expect(secondRotateResult.success).toBe(true);
+  });
+
+  it("rejects rotation to the same admin address with SameAdmin", async () => {
+    const adminConfig = makeConfig(ADMIN_SECRET_KEY);
+    const currentAdminPublicKey = StellarSdk.Keypair.fromSecret(ADMIN_SECRET_KEY).publicKey();
+
+    const result = await sorobanRotateAdmin(adminConfig, currentAdminPublicKey);
+    expect(result.success).toBe(false);
+    expect(result.errorCode).toBe(SorobanErrorCode.SameAdmin);
+  });
+
+  it("returns NotConfigured without touching RPC when config is invalid", async () => {
+    const badConfig = makeConfig("not-a-real-secret-key");
+    const result = await sorobanRotateAdmin(badConfig, "GSOME_ADDRESS");
+    expect(result.success).toBe(false);
+    expect(result.errorCode).toBe(SorobanErrorCode.NotConfigured);
+    expect(mockRpc.simulateTransaction).not.toHaveBeenCalled();
+  });
+
+  it("sorobanGetRotationHistory returns empty array before any rotation", async () => {
+    const config = makeConfig();
+    const history = await sorobanGetRotationHistory(config);
+    expect(history).toEqual([]);
+  });
+
+  it("sorobanGetRotationHistory returns null for invalid contract ID", async () => {
+    const history = await sorobanGetRotationHistory(
+      makeConfig(ADMIN_SECRET_KEY) as any & { contractId: string },
+    );
+    // override contractId with invalid value
+    const badConfig = { ...makeConfig(), contractId: "not-a-contract" };
+    const result = await sorobanGetRotationHistory(badConfig);
+    expect(result).toBeNull();
+  });
+
+  it("accumulates multiple rotation records in order", async () => {
+    const keyA = ADMIN_SECRET_KEY;
+    const keyB = "S" + "E".repeat(55);
+    const keyC = "S" + "F".repeat(55);
+    const pubA = StellarSdk.Keypair.fromSecret(keyA).publicKey();
+    const pubB = StellarSdk.Keypair.fromSecret(keyB).publicKey();
+    const pubC = StellarSdk.Keypair.fromSecret(keyC).publicKey();
+
+    await sorobanRotateAdmin(makeConfig(keyA), pubB);
+    await sorobanRotateAdmin(makeConfig(keyB), pubC);
+
+    const history = await sorobanGetRotationHistory(makeConfig(keyC));
+    expect(history!.length).toBe(2);
+    expect(history![0]!.oldAdmin).toBe(pubA);
+    expect(history![0]!.newAdmin).toBe(pubB);
+    expect(history![1]!.oldAdmin).toBe(pubB);
+    expect(history![1]!.newAdmin).toBe(pubC);
   });
 });
