@@ -6,7 +6,7 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env,
     String, Symbol, Vec,
 };
 
@@ -38,6 +38,7 @@ pub enum ContractError {
     OperationAlreadyApproved = 19,
     OperationNotPending = 20,
     OperationExpired = 21,
+    SameAdmin = 22,
 }
 
 #[contracttype]
@@ -52,6 +53,14 @@ pub enum BallotState {
 pub struct BallotLimits {
     pub max_tokens: u32,
     pub max_votes: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerkleProof {
+    pub vote_hash: BytesN<32>,
+    pub path: Vec<BytesN<32>>,
+    pub index: u32,
 }
 
 #[contracttype]
@@ -81,10 +90,31 @@ pub struct BallotStateSnapshot {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BallotAuditReport {
+    pub admin: Address,
+    pub created_at: u64,
+    pub expiration_time: u64,
+    pub is_consistent: bool,
+    pub result_hash: Option<String>,
+    pub state: BallotState,
+    pub tokens_issued: u32,
+    pub votes_cast: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingUpgrade {
     pub executable_at: u64,
     pub new_wasm_hash: BytesN<32>,
     pub scheduled_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RotationRecord {
+    pub old_admin: Address,
+    pub new_admin: Address,
+    pub rotated_at: u64,
 }
 
 /// Operations that must be approved by the configured M-of-N approvers.
@@ -136,6 +166,7 @@ pub enum DataKey {
     BallotMetadata(String),
     BallotExpired(String),
     PendingUpgrade,
+    RotationHistory,
 }
 
 #[contract]
@@ -599,6 +630,13 @@ impl AnonVoteContract {
         env.storage().instance().get(&DataKey::PendingUpgrade)
     }
 
+    pub fn get_rotation_history(env: Env) -> Vec<RotationRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RotationHistory)
+            .unwrap_or(Vec::new(&env))
+    }
+
     pub fn get_tokens_issued(env: Env, ballot_id_hash: String) -> Option<u32> {
         if !Self::ballot_exists(env.clone(), ballot_id_hash.clone()) {
             return None;
@@ -645,6 +683,17 @@ impl AnonVoteContract {
             .get(&DataKey::BallotMetadata(ballot_id_hash))
     }
 
+    /// Returns the ledger timestamp captured when the ballot was first recorded.
+    /// Returns None if the ballot does not exist.
+    /// The value is immutable — it is set once in record_ballot and never updated.
+    pub fn get_ballot_created_at(env: Env, ballot_id_hash: String) -> Option<u64> {
+        let metadata: BallotMetadata = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BallotMetadata(ballot_id_hash))?;
+        Some(metadata.created_at)
+    }
+
     pub fn get_ballot_state(env: Env, ballot_id_hash: String) -> Option<BallotStateSnapshot> {
         let metadata = Self::require_ballot_metadata(&env, &ballot_id_hash).ok()?;
         Some(BallotStateSnapshot {
@@ -671,6 +720,34 @@ impl AnonVoteContract {
         })
     }
 
+    pub fn get_audit_report(env: Env, ballot_id_hash: String) -> Option<BallotAuditReport> {
+        let metadata = Self::require_ballot_metadata(&env, &ballot_id_hash).ok()?;
+        let tokens: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TokensIssued(ballot_id_hash.clone()))
+            .unwrap_or(0);
+        let votes: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VotesCast(ballot_id_hash.clone()))
+            .unwrap_or(0);
+        let result_hash = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ResultHash(ballot_id_hash));
+        Some(BallotAuditReport {
+            admin: metadata.admin,
+            created_at: metadata.created_at,
+            expiration_time: metadata.expiration_time,
+            is_consistent: tokens == votes,
+            result_hash,
+            state: metadata.state,
+            tokens_issued: tokens,
+            votes_cast: votes,
+        })
+    }
+
     pub fn is_consistent(env: Env, ballot_id_hash: String) -> bool {
         let tokens: u32 = env
             .storage()
@@ -683,6 +760,47 @@ impl AnonVoteContract {
             .get(&DataKey::VotesCast(ballot_id_hash))
             .unwrap_or(0);
         tokens == votes
+    }
+
+    /// Verifies a Merkle proof of a vote against the published result hash.
+    pub fn verify_result_proof(
+        env: Env,
+        ballot_id_hash: String,
+        vote_merkle_proof: MerkleProof,
+        result_hash: String,
+    ) -> Result<bool, ContractError> {
+        let result_key = DataKey::ResultHash(ballot_id_hash.clone());
+        if !env.storage().persistent().has(&result_key) {
+            return Err(ContractError::BallotNotFound);
+        }
+        let stored_result_hash: String = env.storage().persistent().get(&result_key).unwrap();
+
+        let mut current_hash = vote_merkle_proof.vote_hash.clone();
+        let mut idx = vote_merkle_proof.index;
+
+        for sibling in vote_merkle_proof.path.iter() {
+            let mut data = Bytes::new(&env);
+            if idx % 2 == 0 {
+                data.extend_from_array(&current_hash.to_array());
+                data.extend_from_array(&sibling.to_array());
+            } else {
+                data.extend_from_array(&sibling.to_array());
+                data.extend_from_array(&current_hash.to_array());
+            }
+            current_hash = env.crypto().sha256(&data).into();
+            idx /= 2;
+        }
+
+        let computed_root_hex = bytes_to_hex(&env, &current_hash);
+
+        if computed_root_hex != result_hash {
+            return Ok(false);
+        }
+        if stored_result_hash != result_hash {
+            return Ok(false);
+        }
+
+        Ok(true)
     }
 
     fn validate_operation(env: &Env, operation: &CriticalOperation) -> Result<(), ContractError> {
@@ -707,7 +825,17 @@ impl AnonVoteContract {
                     return Err(ContractError::UpgradeAlreadyScheduled);
                 }
             }
-            CriticalOperation::AdminRotation(_) | CriticalOperation::Pause => {}
+            CriticalOperation::AdminRotation(new_admin) => {
+                let current_admin: Address = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Admin)
+                    .ok_or(ContractError::NotInitialized)?;
+                if current_admin == *new_admin {
+                    return Err(ContractError::SameAdmin);
+                }
+            }
+            CriticalOperation::Pause => {}
         }
         Ok(())
     }
@@ -720,10 +848,30 @@ impl AnonVoteContract {
                     .instance()
                     .get(&DataKey::Admin)
                     .ok_or(ContractError::NotInitialized)?;
+                if old_admin == *new_admin {
+                    return Err(ContractError::SameAdmin);
+                }
+                let rotated_at = env.ledger().timestamp();
                 env.storage().instance().set(&DataKey::Admin, new_admin);
+
+                // Append to rotation history stored in persistent storage.
+                let mut history: Vec<RotationRecord> = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::RotationHistory)
+                    .unwrap_or(Vec::new(env));
+                history.push_back(RotationRecord {
+                    old_admin: old_admin.clone(),
+                    new_admin: new_admin.clone(),
+                    rotated_at,
+                });
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::RotationHistory, &history);
+
                 env.events().publish(
-                    (symbol_short!("audit"), symbol_short!("adm_rotd")),
-                    (old_admin, new_admin.clone()),
+                    (symbol_short!("admin"), symbol_short!("rotated")),
+                    (old_admin, new_admin.clone(), rotated_at),
                 );
             }
             CriticalOperation::ResultPublication(ballot_id_hash, result_hash) => {
@@ -899,6 +1047,19 @@ impl AnonVoteContract {
         }
         Ok(())
     }
+}
+
+fn bytes_to_hex(env: &Env, bytes: &BytesN<32>) -> String {
+    let arr = bytes.to_array();
+    let mut buf = [0u8; 64];
+    let hex_chars = b"0123456789abcdef";
+    for i in 0..32 {
+        let byte = arr[i];
+        buf[i * 2] = hex_chars[(byte >> 4) as usize];
+        buf[i * 2 + 1] = hex_chars[(byte & 0xf) as usize];
+    }
+    let rust_str = core::str::from_utf8(&buf).unwrap();
+    String::from_str(env, rust_str)
 }
 
 #[cfg(test)]
@@ -1124,6 +1285,81 @@ mod tests {
     }
 
     #[test]
+    fn admin_rotation_stores_history_and_emits_event() {
+        let (env, client, admin) = setup();
+        let new_admin = Address::generate(&env);
+
+        // Rotate via 1-of-1 (default threshold after initialize)
+        let op_id = client.rotate_admin(&admin, &new_admin);
+        client.approve_operation(&op_id, &admin);
+
+        // New admin is set
+        assert_eq!(client.get_admin(), Some(new_admin.clone()));
+
+        // Rotation history has one entry
+        let history = client.get_rotation_history();
+        assert_eq!(history.len(), 1);
+        let record = history.get(0).unwrap();
+        assert_eq!(record.old_admin, admin);
+        assert_eq!(record.new_admin, new_admin);
+        assert_eq!(record.rotated_at, env.ledger().timestamp());
+    }
+
+    #[test]
+    fn old_admin_loses_privileges_immediately_after_rotation() {
+        let (env, client, admin) = setup();
+        let new_admin = Address::generate(&env);
+
+        let op_id = client.rotate_admin(&admin, &new_admin);
+        client.approve_operation(&op_id, &admin);
+
+        // Old admin can no longer create operations
+        assert_eq!(
+            client.try_rotate_admin(&admin, &Address::generate(&env)),
+            Err(Ok(ContractError::AdminUnauthorized))
+        );
+
+        // New admin can create operations
+        let third = Address::generate(&env);
+        let op2 = client.rotate_admin(&new_admin, &third);
+        client.approve_operation(&op2, &new_admin);
+        assert_eq!(client.get_admin(), Some(third));
+    }
+
+    #[test]
+    fn rotation_to_same_admin_is_rejected() {
+        let (env, client, admin) = setup();
+
+        // validate_operation fires during create_operation, before any approval
+        assert_eq!(
+            client.try_rotate_admin(&admin, &admin),
+            Err(Ok(ContractError::SameAdmin))
+        );
+    }
+
+    #[test]
+    fn rotation_history_accumulates_multiple_records() {
+        let (env, client, admin) = setup();
+        let second = Address::generate(&env);
+        let third = Address::generate(&env);
+
+        let op1 = client.rotate_admin(&admin, &second);
+        client.approve_operation(&op1, &admin);
+
+        env.ledger().with_mut(|l| l.timestamp += 100);
+
+        let op2 = client.rotate_admin(&second, &third);
+        client.approve_operation(&op2, &second);
+
+        let history = client.get_rotation_history();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history.get(0).unwrap().new_admin, second);
+        assert_eq!(history.get(1).unwrap().new_admin, third);
+        // timestamps differ
+        assert!(history.get(1).unwrap().rotated_at > history.get(0).unwrap().rotated_at);
+    }
+
+    #[test]
     fn ballot_limits_and_counts_still_work() {
         let (env, client, admin) = setup();
         let ballot = String::from_str(&env, "limited");
@@ -1137,5 +1373,218 @@ mod tests {
             client.try_record_token(&admin, &ballot),
             Err(Ok(ContractError::LimitExceeded))
         );
+    }
+
+    #[test]
+    fn ballot_audit_report_works() {
+        let (env, client, admin) = setup();
+        let ballot = String::from_str(&env, "audit-ballot");
+        
+        // Report for non-existent ballot should be None
+        assert_eq!(client.get_audit_report(&ballot), None);
+
+        // Record ballot
+        client.record_ballot(&admin, &ballot, &limits(10, 10));
+
+        // Get report
+        let report = client.get_audit_report(&ballot).unwrap();
+        assert_eq!(report.admin, admin);
+        assert_eq!(report.created_at, env.ledger().timestamp());
+        assert_eq!(report.expiration_time, 0);
+        assert!(report.is_consistent);
+        assert_eq!(report.result_hash, None);
+        assert_eq!(report.state, BallotState::Active);
+        assert_eq!(report.tokens_issued, 0);
+        assert_eq!(report.votes_cast, 0);
+
+        // Record tokens/votes and assert matches individual reads
+        client.record_token(&admin, &ballot);
+        client.record_vote(&admin, &ballot);
+        
+        let report2 = client.get_audit_report(&ballot).unwrap();
+        assert_eq!(report2.tokens_issued, client.get_tokens_issued(&ballot).unwrap());
+        assert_eq!(report2.votes_cast, client.get_votes_cast(&ballot).unwrap());
+        assert_eq!(report2.is_consistent, client.is_consistent(&ballot));
+        assert!(report2.is_consistent);
+
+        // Make inconsistent
+        client.record_token(&admin, &ballot);
+        let report3 = client.get_audit_report(&ballot).unwrap();
+        assert_eq!(report3.tokens_issued, 2);
+        assert_eq!(report3.votes_cast, 1);
+        assert_eq!(report3.is_consistent, client.is_consistent(&ballot));
+        assert!(!report3.is_consistent);
+
+        // Publish result
+        let result = String::from_str(&env, "election-result");
+        let operation_id = client.record_result(&admin, &ballot, &result);
+        client.approve_operation(&operation_id, &admin);
+
+        let report4 = client.get_audit_report(&ballot).unwrap();
+        assert_eq!(report4.state, BallotState::ResultPublished);
+        assert_eq!(report4.result_hash, Some(result));
+    }
+
+    #[test]
+    fn verify_result_proof_works() {
+        let (env, client, admin) = setup();
+        let ballot = String::from_str(&env, "merkle-ballot");
+        client.record_ballot(&admin, &ballot, &limits(10, 10));
+
+        let leaf0_bytes = [1u8; 32];
+        let leaf1_bytes = [2u8; 32];
+        let leaf0 = BytesN::from_array(&env, &leaf0_bytes);
+        let leaf1 = BytesN::from_array(&env, &leaf1_bytes);
+
+        let mut data = Bytes::new(&env);
+        data.extend_from_array(&leaf0_bytes);
+        data.extend_from_array(&leaf1_bytes);
+        let root: BytesN<32> = env.crypto().sha256(&data).into();
+        let root_hex = bytes_to_hex(&env, &root);
+
+        // Try verification before result is published - should fail with BallotNotFound
+        let proof0 = MerkleProof {
+            vote_hash: leaf0.clone(),
+            path: Vec::from_array(&env, [leaf1.clone()]),
+            index: 0,
+        };
+        let res = client.try_verify_result_proof(&ballot, &proof0, &root_hex);
+        assert_eq!(res, Err(Ok(ContractError::BallotNotFound)));
+
+        // Publish result
+        let op_id = client.record_result(&admin, &ballot, &root_hex);
+        client.approve_operation(&op_id, &admin);
+
+        // Verify valid proof for leaf 0
+        assert!(client.verify_result_proof(&ballot, &proof0, &root_hex));
+
+        // Verify valid proof for leaf 1
+        let proof1 = MerkleProof {
+            vote_hash: leaf1.clone(),
+            path: Vec::from_array(&env, [leaf0.clone()]),
+            index: 1,
+        };
+        assert!(client.verify_result_proof(&ballot, &proof1, &root_hex));
+
+        // Verify valid proof for a single-node tree (empty path, leaf is root)
+        let single_root_hex = bytes_to_hex(&env, &leaf0);
+        let ballot_single = String::from_str(&env, "single-node-ballot");
+        client.record_ballot(&admin, &ballot_single, &limits(10, 10));
+        let op_id_single = client.record_result(&admin, &ballot_single, &single_root_hex);
+        client.approve_operation(&op_id_single, &admin);
+
+        let proof_single = MerkleProof {
+            vote_hash: leaf0.clone(),
+            path: Vec::new(&env),
+            index: 0,
+        };
+        assert!(client.verify_result_proof(&ballot_single, &proof_single, &single_root_hex));
+
+        // Verify invalid proof: invalid vote hash
+        let invalid_vote_proof = MerkleProof {
+            vote_hash: BytesN::from_array(&env, &[0u8; 32]),
+            path: Vec::from_array(&env, [leaf1.clone()]),
+            index: 0,
+        };
+        assert!(!client.verify_result_proof(&ballot, &invalid_vote_proof, &root_hex));
+
+        // Verify invalid proof: invalid path (wrong sibling hash)
+        let invalid_path_proof = MerkleProof {
+            vote_hash: leaf0.clone(),
+            path: Vec::from_array(&env, [BytesN::from_array(&env, &[0u8; 32])]),
+            index: 0,
+        };
+        assert!(!client.verify_result_proof(&ballot, &invalid_path_proof, &root_hex));
+
+        // Verify invalid proof: wrong index
+        let invalid_idx_proof = MerkleProof {
+            vote_hash: leaf0.clone(),
+            path: Vec::from_array(&env, [leaf1.clone()]),
+            index: 1,
+        };
+        assert!(!client.verify_result_proof(&ballot, &invalid_idx_proof, &root_hex));
+
+        // Verify mismatching result_hash parameter
+        let wrong_root_hex = String::from_str(&env, "0000000000000000000000000000000000000000000000000000000000000000");
+        assert!(!client.verify_result_proof(&ballot, &proof0, &wrong_root_hex));
+
+        // Verify non-existent ballot
+        let non_existent_ballot = String::from_str(&env, "non-existent-ballot");
+        let res = client.try_verify_result_proof(&non_existent_ballot, &proof0, &root_hex);
+        assert_eq!(res, Err(Ok(ContractError::BallotNotFound)));
+    }
+
+    #[test]
+    fn get_ballot_created_at_returns_timestamp_set_at_creation() {
+        let (env, client, admin) = setup();
+        let ballot = String::from_str(&env, "ts-ballot");
+
+        // Before creation: returns None
+        assert_eq!(client.get_ballot_created_at(&ballot), None);
+
+        // Record at a known timestamp
+        let creation_time = env.ledger().timestamp();
+        client.record_ballot(&admin, &ballot, &limits(10, 10));
+
+        // After creation: returns the ledger timestamp at creation
+        assert_eq!(client.get_ballot_created_at(&ballot), Some(creation_time));
+    }
+
+    #[test]
+    fn get_ballot_created_at_is_immutable_after_state_changes() {
+        let (env, client, admin) = setup();
+        let ballot = String::from_str(&env, "immutable-ts-ballot");
+
+        client.record_ballot(&admin, &ballot, &limits(10, 10));
+        let creation_time = client.get_ballot_created_at(&ballot).unwrap();
+
+        // Advance ledger time, record tokens and votes
+        env.ledger().with_mut(|l| l.timestamp += 100);
+        client.record_token(&admin, &ballot);
+        client.record_vote(&admin, &ballot);
+
+        // Timestamp must not change
+        assert_eq!(client.get_ballot_created_at(&ballot), Some(creation_time));
+
+        // Advance again and publish result; timestamp still unchanged
+        env.ledger().with_mut(|l| l.timestamp += 100);
+        let result = String::from_str(&env, "result-hash");
+        let op_id = client.record_result(&admin, &ballot, &result);
+        client.approve_operation(&op_id, &admin);
+
+        assert_eq!(client.get_ballot_created_at(&ballot), Some(creation_time));
+    }
+
+    #[test]
+    fn get_ballot_created_at_matches_metadata_and_audit_report() {
+        let (env, client, admin) = setup();
+        let ballot = String::from_str(&env, "cross-check-ballot");
+
+        client.record_ballot(&admin, &ballot, &limits(10, 10));
+
+        let created_at = client.get_ballot_created_at(&ballot).unwrap();
+        let metadata   = client.get_ballot_metadata(&ballot).unwrap();
+        let report     = client.get_audit_report(&ballot).unwrap();
+
+        assert_eq!(created_at, metadata.created_at);
+        assert_eq!(created_at, report.created_at);
+    }
+
+    #[test]
+    fn ballots_created_at_different_ledger_times_have_distinct_timestamps() {
+        let (env, client, admin) = setup();
+        let ballot_a = String::from_str(&env, "ballot-a");
+        let ballot_b = String::from_str(&env, "ballot-b");
+
+        client.record_ballot(&admin, &ballot_a, &limits(10, 10));
+        let ts_a = client.get_ballot_created_at(&ballot_a).unwrap();
+
+        // Advance ledger time before creating second ballot
+        env.ledger().with_mut(|l| l.timestamp += 60);
+        client.record_ballot(&admin, &ballot_b, &limits(10, 10));
+        let ts_b = client.get_ballot_created_at(&ballot_b).unwrap();
+
+        assert!(ts_b > ts_a);
+        assert_eq!(ts_b - ts_a, 60);
     }
 }

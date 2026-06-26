@@ -39,6 +39,17 @@ export enum SorobanErrorCode {
   NoUpgradeScheduled    = 10,
   TimeLockNotExpired      = 11,
   InvalidStateTransition  = 12,
+  BallotExpired           = 13,
+  ContractPaused          = 14,
+  LimitExceeded           = 15,
+  InvalidApprovalConfig   = 16,
+  DuplicateApprover       = 17,
+  ApproverUnauthorized    = 18,
+  OperationNotFound       = 19,
+  OperationAlreadyApproved = 20,
+  OperationNotPending     = 21,
+  OperationExpired        = 22,
+  SameAdmin               = 23,
   // Non-contract errors
   SimulationFailed       = 100,
   TransactionFailed      = 101,
@@ -59,6 +70,17 @@ const ERROR_MESSAGES: Record<SorobanErrorCode, string> = {
   [SorobanErrorCode.NoUpgradeScheduled]:    "No upgrade is currently scheduled",
   [SorobanErrorCode.TimeLockNotExpired]:      "Time lock has not yet expired for the scheduled upgrade",
   [SorobanErrorCode.InvalidStateTransition]: "Invalid state transition — only Active→ResultPublished→Archived is allowed",
+  [SorobanErrorCode.BallotExpired]:          "Ballot has expired",
+  [SorobanErrorCode.ContractPaused]:         "Contract is currently paused",
+  [SorobanErrorCode.LimitExceeded]:          "Ballot token or vote limit exceeded",
+  [SorobanErrorCode.InvalidApprovalConfig]:  "Invalid M-of-N approval configuration",
+  [SorobanErrorCode.DuplicateApprover]:      "Duplicate address in approver list",
+  [SorobanErrorCode.ApproverUnauthorized]:   "Caller is not a configured approver for this operation",
+  [SorobanErrorCode.OperationNotFound]:      "Operation not found",
+  [SorobanErrorCode.OperationAlreadyApproved]: "Approver has already approved this operation",
+  [SorobanErrorCode.OperationNotPending]:    "Operation is not in pending status",
+  [SorobanErrorCode.OperationExpired]:       "Operation approval window has expired",
+  [SorobanErrorCode.SameAdmin]:              "New admin must be different from the current admin",
   [SorobanErrorCode.SimulationFailed]:       "Transaction simulation failed",
   [SorobanErrorCode.TransactionFailed]:      "Transaction submission failed",
   [SorobanErrorCode.NetworkError]:           "Network or RPC error",
@@ -107,6 +129,23 @@ export interface BallotStateSnapshot {
   admin: string;
   state: BallotState;
   state_updated_at: number;
+}
+
+export interface BallotAuditReport {
+  admin: string;
+  created_at: number;
+  expiration_time: number;
+  is_consistent: boolean;
+  result_hash: string | null;
+  state: BallotState;
+  tokens_issued: number;
+  votes_cast: number;
+}
+
+export interface MerkleProof {
+  vote_hash: string;
+  path: string[];
+  index: number;
 }
 
 export interface SorobanInvokeResult {
@@ -166,6 +205,43 @@ export interface ConfigError {
   message: string;
 }
 
+export function validateContractId(
+  contractId: string,
+): { valid: true } | { valid: false; error: ConfigError } {
+  const isValid = StellarSdk.StrKey.isValidContract
+    ? StellarSdk.StrKey.isValidContract(contractId)
+    : (StellarSdk.StrKey as any).isValidContractId(contractId);
+  if (!isValid) {
+    return {
+      valid: false,
+      error: {
+        field: "contractId",
+        message: "Invalid contract ID format",
+      },
+    };
+  }
+  return { valid: true };
+}
+
+export function validateSorobanConfig(
+  config: SorobanConfig,
+): { valid: true } | { valid: false; error: ConfigError } {
+  if (!config.stellarSecretKey || !StellarSdk.StrKey.isValidEd25519SecretSeed(config.stellarSecretKey)) {
+    return {
+      valid: false,
+      error: {
+        field: "stellarSecretKey",
+        message: "Invalid stellarSecretKey format",
+      },
+    };
+  }
+  const contractCheck = validateContractId(config.contractId);
+  if (!contractCheck.valid) {
+    return contractCheck;
+  }
+  return { valid: true };
+}
+
 export interface BallotLimits {
   maxTokens: number;
   maxVotes: number;
@@ -216,6 +292,7 @@ const EVENT_SYMBOL_TO_TYPE: Record<string, SorobanAuditEventType> = {
   cnt_ovflw: "counter_overflow",
   counter_overflow: "counter_overflow",
   adm_rotd: "admin_rotated",
+  rotated: "admin_rotated",
   admin_rotated: "admin_rotated",
   upg_schd: "upgrade_scheduled",
   upgrade_scheduled: "upgrade_scheduled",
@@ -233,7 +310,7 @@ const EVENT_TYPE_TO_SYMBOL: Record<SorobanAuditEventType, string> = {
   vote_cast: "vote_cast",
   result_published: "res_pub",
   counter_overflow: "cnt_ovflw",
-  admin_rotated: "adm_rotd",
+  admin_rotated: "rotated",
   upgrade_scheduled: "upg_schd",
   upgrade_canceled: "upg_cncl",
   upgrade_executed: "upg_excd",
@@ -277,9 +354,12 @@ function getEventValue(event: any): unknown {
 }
 
 function getEventTypeFromTopics(topics: unknown[]): SorobanAuditEventType | string {
+  // Filter out known namespace prefixes ("audit", "govern", "admin") then
+  // look up the remaining topic symbol in the event type map.
+  const NAMESPACE_PREFIXES = new Set(["audit", "govern", "admin"]);
   const eventTopic = topics.find((topic) => {
     const value = String(topic ?? "");
-    return value !== "audit" && EVENT_SYMBOL_TO_TYPE[value] !== undefined;
+    return !NAMESPACE_PREFIXES.has(value) && EVENT_SYMBOL_TO_TYPE[value] !== undefined;
   });
   return normalizeEventType(eventTopic ?? "");
 }
@@ -329,6 +409,7 @@ export function parseSorobanEvent(event: unknown): SorobanEventData {
     case "admin_rotated":
       parsed.previousAdmin = tuple[0] !== undefined ? String(tuple[0]) : undefined;
       parsed.newAdmin = tuple[1] !== undefined ? String(tuple[1]) : undefined;
+      parsed.transitionedAt = tuple[2] !== undefined ? Number(tuple[2]) : undefined;
       break;
     case "upgrade_scheduled":
       parsed.admin = tuple[0] !== undefined ? String(tuple[0]) : undefined;
@@ -636,14 +717,20 @@ export async function sorobanFilterEvents(
 export async function sorobanRecordBallot(
   config: SorobanConfig,
   ballotIdHash: string,
-  limits: BallotLimits,
-): Promise<string> {
-  if (!config.contractId) return "";
+  limits?: BallotLimits,
+): Promise<SorobanInvokeResult> {
+  const configCheck = validateSorobanConfig(config);
+  if (!configCheck.valid) {
+    console.warn(`[Soroban] sorobanRecordBallot: ${configCheck.error.message}`);
+    return { txHash: "", success: false, ...makeError(SorobanErrorCode.NotConfigured) };
+  }
+  const caller = StellarSdk.Keypair.fromSecret(config.stellarSecretKey).publicKey();
+  const ballotLimits = limits ?? { maxTokens: 10000, maxVotes: 10000 };
   const result = await invokeContract(config, "record_ballot", [
     { value: caller, type: "address" },
     { value: ballotIdHash, type: "string" },
     {
-      value: { max_tokens: limits.maxTokens, max_votes: limits.maxVotes },
+      value: { max_tokens: ballotLimits.maxTokens, max_votes: ballotLimits.maxVotes },
       type: "map",
     },
   ]);
@@ -768,9 +855,9 @@ export async function sorobanRecordResult(
 }
 
 /**
- * Rotate the contract admin to a new address.
- * Must be called by the current admin.
- * Returns the full SorobanInvokeResult — see sorobanRecordBallot doc.
+ * Rotate the contract admin via M-of-N governance (creates a pending operation).
+ * Must be called by the current admin. Rejects if new_admin equals current admin (SameAdmin).
+ * Returns the operation ID wrapped in SorobanInvokeResult.returnValue on success.
  */
 export async function sorobanRotateAdmin(
   config: SorobanConfig,
@@ -792,6 +879,27 @@ export async function sorobanRotateAdmin(
     );
   }
   return result;
+}
+
+/**
+ * Read the on-chain admin rotation history (view call — no transaction).
+ * Returns records in chronological order (oldest first).
+ * Returns null if config is invalid or the query fails.
+ */
+export async function sorobanGetRotationHistory(
+  config: SorobanConfig,
+): Promise<Array<{ oldAdmin: string; newAdmin: string; rotatedAt: number }> | null> {
+  const contractCheck = validateContractId(config.contractId);
+  if (!contractCheck.valid) return null;
+  const { value, errorCode } = await readContract(config, "get_rotation_history", []);
+  if (errorCode !== undefined) return null;
+  const raw = value as Array<{ old_admin: string; new_admin: string; rotated_at: number }> | null;
+  if (!Array.isArray(raw)) return [];
+  return raw.map((r) => ({
+    oldAdmin: String(r.old_admin ?? ""),
+    newAdmin: String(r.new_admin ?? ""),
+    rotatedAt: Number(r.rotated_at ?? 0),
+  }));
 }
 
 /**
@@ -886,6 +994,72 @@ export async function sorobanGetBallotState(
     { value: ballotIdHash, type: "string" },
   ]);
   return value as BallotStateSnapshot | null;
+}
+
+/**
+ * Returns the ledger timestamp (Unix seconds) captured when the ballot was
+ * first recorded on-chain via record_ballot().
+ *
+ * The value is immutable — it is set exactly once and never updated by
+ * subsequent operations (token issuance, votes, result publication, etc.).
+ * Returns null if the ballot does not exist or the config / RPC call fails.
+ *
+ * Stellar block times are ~5-6 seconds, so timestamps have that granularity.
+ */
+export async function sorobanGetBallotCreatedAt(
+  config: SorobanConfig,
+  ballotIdHash: string,
+): Promise<number | null> {
+  const contractCheck = validateContractId(config.contractId);
+  if (!contractCheck.valid) return null;
+  const { value, errorCode } = await readContract(config, "get_ballot_created_at", [
+    { value: ballotIdHash, type: "string" },
+  ]);
+  if (errorCode !== undefined) return null;
+  // Contract returns Option<u64>: None → undefined/null, Some(ts) → number
+  if (value === null || value === undefined) return null;
+  return Number(value);
+}
+
+/**
+ * Get complete ballot consistency audit report (single read call).
+ */
+export async function sorobanGetAuditReport(
+  config: SorobanConfig,
+  ballotIdHash: string,
+): Promise<BallotAuditReport | null> {
+  const contractCheck = validateContractId(config.contractId);
+  if (!contractCheck.valid) return null;
+  const { value } = await readContract(config, "get_audit_report", [
+    { value: ballotIdHash, type: "string" },
+  ]);
+  return value as BallotAuditReport | null;
+}
+
+/**
+ * Verify a Merkle proof of a vote against the published result hash.
+ */
+export async function sorobanVerifyResultProof(
+  config: SorobanConfig,
+  ballotIdHash: string,
+  voteMerkleProof: MerkleProof,
+  resultHash: string,
+): Promise<boolean | null> {
+  const contractCheck = validateContractId(config.contractId);
+  if (!contractCheck.valid) return null;
+
+  const voteMerkleProofSc = {
+    index: voteMerkleProof.index,
+    path: voteMerkleProof.path.map(p => Buffer.from(p, "hex")),
+    vote_hash: Buffer.from(voteMerkleProof.vote_hash, "hex"),
+  };
+
+  const { value } = await readContract(config, "verify_result_proof", [
+    { value: ballotIdHash, type: "string" },
+    { value: voteMerkleProofSc, type: "map" },
+    { value: resultHash, type: "string" },
+  ]);
+  return value as boolean | null;
 }
 
 /**

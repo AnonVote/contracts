@@ -13,12 +13,27 @@
  * tested without a live network, per the issue's acceptance criteria.
  */
 
+import * as crypto from "crypto";
+
+interface MerkleProof {
+  vote_hash: Buffer;
+  path: Buffer[];
+  index: number;
+}
+
 type FakeBallot = {
   admin: string;
+  createdAt: number;
   tokensIssued: number;
   votesCast: number;
   resultHash: string | null;
   state: "Active" | "ResultPublished" | "Archived";
+};
+
+type RotationRecord = {
+  old_admin: string;
+  new_admin: string;
+  rotated_at: number;
 };
 
 export type LedgerOutcome =
@@ -27,14 +42,33 @@ export type LedgerOutcome =
 
 // Mirrors ContractError in lib.rs
 const ContractErrorCode = {
+  AdminUnauthorized: 1,
   BallotNotFound: 4,
   BallotAlreadyExists: 5,
   ResultAlreadyPublished: 6,
   InvalidStateTransition: 12,
+  SameAdmin: 22,
 };
+
+const FAKE_LEDGER_TIMESTAMP = 1718880000;
 
 export class FakeLedger {
   private ballots = new Map<string, FakeBallot>();
+  private admin: string = "";
+  private rotationHistory: RotationRecord[] = [];
+  private timestamp: number = FAKE_LEDGER_TIMESTAMP;
+
+  setAdmin(admin: string) {
+    this.admin = admin;
+  }
+
+  getTimestamp() {
+    return this.timestamp;
+  }
+
+  advanceTime(seconds: number) {
+    this.timestamp += seconds;
+  }
 
   call(method: string, args: { value: unknown }[]): LedgerOutcome {
     const get = (i: number) => args[i]?.value;
@@ -50,6 +84,7 @@ export class FakeLedger {
         }
         this.ballots.set(ballotIdHash, {
           admin: caller,
+          createdAt: this.timestamp,
           tokensIssued: 0,
           votesCast: 0,
           resultHash: null,
@@ -82,6 +117,28 @@ export class FakeLedger {
         ballot.resultHash = resultHash;
         ballot.state = "ResultPublished";
         return { ok: true };
+      }
+
+      case "rotate_admin": {
+        // caller is args[0], new_admin is args[1]
+        const caller = get(0) as string;
+        const newAdmin = get(1) as string;
+        if (this.admin && caller !== this.admin) {
+          return { ok: false, contractErrorCode: ContractErrorCode.AdminUnauthorized };
+        }
+        if (this.admin === newAdmin) {
+          return { ok: false, contractErrorCode: ContractErrorCode.SameAdmin };
+        }
+        // rotate_admin returns an operation_id (u64) — fake returns 0 for simplicity
+        // and immediately applies the rotation (simulates 1-of-1 threshold)
+        const oldAdmin = this.admin;
+        this.rotationHistory.push({ old_admin: oldAdmin, new_admin: newAdmin, rotated_at: this.timestamp });
+        this.admin = newAdmin;
+        return { ok: true, value: 0 };
+      }
+
+      case "get_rotation_history": {
+        return { ok: true, value: this.rotationHistory };
       }
 
       case "transition_ballot_state": {
@@ -125,6 +182,68 @@ export class FakeLedger {
         return { ok: true, value: ballot.tokensIssued === ballot.votesCast };
       }
 
+      case "get_ballot_created_at": {
+        const ballot = this.ballots.get(get(0) as string);
+        // Matches Option<u64>::None when ballot doesn't exist
+        return { ok: true, value: ballot ? ballot.createdAt : undefined };
+      }
+
+      case "get_audit_report": {
+        const ballotIdHash = get(0) as string;
+        const ballot = this.ballots.get(ballotIdHash);
+        if (!ballot) return { ok: true, value: undefined }; // matches Option::None
+        return {
+          ok: true,
+          value: {
+            admin: ballot.admin,
+            created_at: FAKE_LEDGER_TIMESTAMP,
+            expiration_time: 0,
+            is_consistent: ballot.tokensIssued === ballot.votesCast,
+            result_hash: ballot.resultHash,
+            state: ballot.state,
+            tokens_issued: ballot.tokensIssued,
+            votes_cast: ballot.votesCast,
+          },
+        };
+      }
+
+      case "verify_result_proof": {
+        const ballotIdHash = get(0) as string;
+        const ballot = this.ballots.get(ballotIdHash);
+        if (!ballot) return { ok: false, contractErrorCode: ContractErrorCode.BallotNotFound };
+        if (ballot.resultHash === null) {
+          return { ok: false, contractErrorCode: ContractErrorCode.BallotNotFound };
+        }
+
+        const proof = get(1) as MerkleProof;
+        const resultHashParam = get(2) as string;
+
+        let currentHash = proof.vote_hash;
+        let idx = proof.index;
+
+        for (const sibling of proof.path) {
+          let data: Buffer;
+          if (idx % 2 === 0) {
+            data = Buffer.concat([currentHash, sibling]);
+          } else {
+            data = Buffer.concat([sibling, currentHash]);
+          }
+          currentHash = crypto.createHash("sha256").update(data).digest();
+          idx = Math.floor(idx / 2);
+        }
+
+        const computedRootHex = currentHash.toString("hex");
+
+        if (computedRootHex !== resultHashParam) {
+          return { ok: true, value: false };
+        }
+        if (ballot.resultHash !== resultHashParam) {
+          return { ok: true, value: false };
+        }
+
+        return { ok: true, value: true };
+      }
+
       default:
         throw new Error(`FakeLedger: unhandled method "${method}"`);
     }
@@ -132,5 +251,8 @@ export class FakeLedger {
 
   reset() {
     this.ballots.clear();
+    this.admin = "";
+    this.rotationHistory = [];
+    this.timestamp = FAKE_LEDGER_TIMESTAMP;
   }
 }
