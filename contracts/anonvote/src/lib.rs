@@ -7,7 +7,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env,
-    String, Vec,
+    String, Symbol, Vec,
 };
 
 const APPROVAL_EXPIRATION_SECONDS: u64 = 7 * 24 * 60 * 60;
@@ -347,6 +347,7 @@ impl AnonVoteContract {
         approver_address: Address,
     ) -> Result<bool, ContractError> {
         approver_address.require_auth();
+        Self::verify_initialized(&env)?;
 
         let key = DataKey::Operation(operation_id);
         let mut pending: PendingOperation = env
@@ -558,6 +559,7 @@ impl AnonVoteContract {
     }
 
     pub fn execute_upgrade(env: Env) -> Result<(), ContractError> {
+        Self::verify_initialized(&env)?;
         let pending: PendingUpgrade = env
             .storage()
             .instance()
@@ -928,7 +930,70 @@ impl AnonVoteContract {
         Ok(())
     }
 
+    /// Verifies the contract completed `initialize` and instance storage is consistent.
+    fn verify_initialized(env: &Env) -> Result<(), ContractError> {
+        if env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Admin)
+            .is_none()
+        {
+            Self::publish_init_inconsistency(env, symbol_short!("no_admin"));
+            return Err(ContractError::NotInitialized);
+        }
+
+        if env
+            .storage()
+            .instance()
+            .get::<DataKey, u64>(&DataKey::InitializedAt)
+            .is_none()
+        {
+            Self::publish_init_inconsistency(env, symbol_short!("no_ts"));
+            return Err(ContractError::NotInitialized);
+        }
+
+        if env.storage().instance().get::<DataKey, bool>(&DataKey::IsPaused).is_none() {
+            Self::publish_init_inconsistency(env, symbol_short!("no_pause"));
+            return Err(ContractError::NotInitialized);
+        }
+
+        let approvers: Vec<Address> = match env
+            .storage()
+            .instance()
+            .get::<DataKey, Vec<Address>>(&DataKey::Approvers)
+        {
+            Some(approvers) if !approvers.is_empty() => approvers,
+            _ => {
+                Self::publish_init_inconsistency(env, symbol_short!("no_appr"));
+                return Err(ContractError::NotInitialized);
+            }
+        };
+
+        let threshold_valid = env
+            .storage()
+            .instance()
+            .get::<DataKey, u32>(&DataKey::ApprovalThreshold)
+            .map(|threshold| threshold > 0 && threshold <= approvers.len())
+            .unwrap_or(false);
+        if !threshold_valid {
+            Self::publish_init_inconsistency(env, symbol_short!("bad_thr"));
+            return Err(ContractError::NotInitialized);
+        }
+
+        if env.storage().instance().get::<DataKey, u64>(&DataKey::OperationNonce).is_none() {
+            Self::publish_init_inconsistency(env, symbol_short!("no_nonce"));
+            return Err(ContractError::NotInitialized);
+        }
+
+        Ok(())
+    }
+
+    fn publish_init_inconsistency(env: &Env, reason: Symbol) {
+        env.events().publish((symbol_short!("init"), symbol_short!("invalid")), reason);
+    }
+
     fn require_admin(env: &Env, caller: &Address) -> Result<(), ContractError> {
+        Self::verify_initialized(env)?;
         let admin: Address = env
             .storage()
             .instance()
@@ -1030,6 +1095,67 @@ mod tests {
         let approvers = Vec::from_array(env, [first.clone(), second.clone(), third.clone()]);
         client.configure_approval_threshold(admin, &approvers, &2, &3);
         (first, second, third)
+    }
+
+    fn setup_uninitialized() -> (Env, AnonVoteContractClient<'static>, Address, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, AnonVoteContract);
+        let client = AnonVoteContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        (env, client, admin, contract_id)
+    }
+
+    #[test]
+    fn contract_is_valid_after_initialization() {
+        let (env, client, admin) = setup();
+        let ballot = String::from_str(&env, "initialized");
+        client.record_ballot(&admin, &ballot, &limits(10, 10));
+        assert_eq!(client.get_admin(), Some(admin));
+        assert_eq!(client.get_tokens_issued(&ballot), Some(0));
+    }
+
+    #[test]
+    fn write_operations_reject_uninitialized_contract() {
+        let (env, client, admin, _) = setup_uninitialized();
+        let ballot = String::from_str(&env, "uninitialized");
+        let approver = Address::generate(&env);
+
+        assert_eq!(
+            client.try_record_ballot(&admin, &ballot, &limits(1, 1)),
+            Err(Ok(ContractError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_configure_approval_threshold(
+                &admin,
+                &Vec::from_array(&env, [approver.clone()]),
+                &1,
+                &1,
+            ),
+            Err(Ok(ContractError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_approve_operation(&1, &approver),
+            Err(Ok(ContractError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_execute_upgrade(),
+            Err(Ok(ContractError::NotInitialized))
+        );
+    }
+
+    #[test]
+    fn partial_initialization_is_rejected() {
+        let (env, client, admin, contract_id) = setup_uninitialized();
+        env.as_contract(&contract_id, || {
+            env.storage().instance().set(&DataKey::Admin, &admin);
+        });
+
+        let ballot = String::from_str(&env, "partial");
+        assert_eq!(
+            client.try_record_ballot(&admin, &ballot, &limits(1, 1)),
+            Err(Ok(ContractError::NotInitialized))
+        );
     }
 
     #[test]
