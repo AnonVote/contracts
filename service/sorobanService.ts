@@ -38,18 +38,17 @@ export enum SorobanErrorCode {
   UpgradeAlreadyScheduled = 9,
   NoUpgradeScheduled    = 10,
   TimeLockNotExpired      = 11,
-  InvalidStateTransition  = 12,
-  BallotExpired           = 13,
-  ContractPaused          = 14,
-  LimitExceeded           = 15,
-  InvalidApprovalConfig   = 16,
-  DuplicateApprover       = 17,
-  ApproverUnauthorized    = 18,
-  OperationNotFound       = 19,
-  OperationAlreadyApproved = 20,
-  OperationNotPending     = 21,
-  OperationExpired        = 22,
-  SameAdmin               = 23,
+  BallotExpired           = 12,
+  ContractPaused          = 13,
+  LimitExceeded           = 14,
+  InvalidApprovalConfig   = 15,
+  DuplicateApprover       = 16,
+  ApproverUnauthorized    = 17,
+  OperationNotFound       = 18,
+  OperationAlreadyApproved = 19,
+  OperationNotPending     = 20,
+  OperationExpired        = 21,
+  SameAdmin               = 22,
   // Non-contract errors
   SimulationFailed       = 100,
   TransactionFailed      = 101,
@@ -69,7 +68,6 @@ const ERROR_MESSAGES: Record<SorobanErrorCode, string> = {
   [SorobanErrorCode.UpgradeAlreadyScheduled]: "An upgrade is already scheduled",
   [SorobanErrorCode.NoUpgradeScheduled]:    "No upgrade is currently scheduled",
   [SorobanErrorCode.TimeLockNotExpired]:      "Time lock has not yet expired for the scheduled upgrade",
-  [SorobanErrorCode.InvalidStateTransition]: "Invalid state transition — only Active→ResultPublished→Archived is allowed",
   [SorobanErrorCode.BallotExpired]:          "Ballot has expired",
   [SorobanErrorCode.ContractPaused]:         "Contract is currently paused",
   [SorobanErrorCode.LimitExceeded]:          "Ballot token or vote limit exceeded",
@@ -739,6 +737,55 @@ export async function sorobanRecordBallot(
       `[Soroban] sorobanRecordBallot failed — ${SorobanErrorCode[result.errorCode]}: ${result.errorMessage}`,
     );
   }
+  return result;
+}
+
+/**
+ * Record a batch of ballots atomically in a single transaction.
+ *
+ * The contract validates every ballot before writing any of them, so the
+ * batch either fully succeeds or fully fails (all-or-nothing semantics).
+ *
+ * On success, `returnValue` is the array of ballot ID hashes that were
+ * recorded, in the same order they were supplied.
+ *
+ * @param ballots - Array of `{ ballotIdHash, limits }` entries to record.
+ *                  Defaults to `{ maxTokens: 10000, maxVotes: 10000 }` when
+ *                  `limits` is omitted for a given entry.
+ */
+export async function sorobanRecordBallotsBatch(
+  config: SorobanConfig,
+  ballots: Array<{ ballotIdHash: string; limits?: BallotLimits }>,
+): Promise<SorobanInvokeResult> {
+  const configCheck = validateSorobanConfig(config);
+  if (!configCheck.valid) {
+    console.warn(`[Soroban] sorobanRecordBallotsBatch: ${configCheck.error.message}`);
+    return { txHash: "", success: false, ...makeError(SorobanErrorCode.NotConfigured) };
+  }
+
+  const caller = StellarSdk.Keypair.fromSecret(config.stellarSecretKey).publicKey();
+
+  // Build the Vec<(String, BallotLimits)> argument expected by record_ballots_batch.
+  // Each element is a 2-tuple encoded as a map with the Soroban SDK.
+  const ballotsArg = ballots.map(({ ballotIdHash, limits: l }) => {
+    const ballotLimits = l ?? { maxTokens: 10000, maxVotes: 10000 };
+    return [
+      ballotIdHash,
+      { max_tokens: ballotLimits.maxTokens, max_votes: ballotLimits.maxVotes },
+    ];
+  });
+
+  const result = await invokeContract(config, "record_ballots_batch", [
+    { value: caller, type: "address" },
+    { value: ballotsArg, type: "vec" },
+  ]);
+
+  if (!result.success && result.errorCode !== undefined) {
+    console.error(
+      `[Soroban] sorobanRecordBallotsBatch failed — ${SorobanErrorCode[result.errorCode]}: ${result.errorMessage}`,
+    );
+  }
+
   return result;
 }
 
