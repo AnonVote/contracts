@@ -435,6 +435,65 @@ impl AnonVoteContract {
         Ok(())
     }
 
+    /// Records multiple ballots atomically.
+    ///
+    /// All ballots are validated first; if any ballot is invalid the entire
+    /// batch is rejected and no state is written.  On success, returns a
+    /// `Vec<String>` containing the ballot_id_hash of every recorded ballot,
+    /// in the same order they were supplied.
+    pub fn record_ballots_batch(
+        env: Env,
+        caller: Address,
+        ballots: Vec<(String, BallotLimits)>,
+    ) -> Result<Vec<String>, ContractError> {
+        caller.require_auth();
+        Self::require_not_paused(&env)?;
+        Self::require_admin(&env, &caller)?;
+
+        // ── Phase 1: validate everything before writing anything ──────────
+        for i in 0..ballots.len() {
+            let (ballot_id_hash, _) = ballots.get(i).unwrap();
+            if ballot_id_hash.is_empty() {
+                return Err(ContractError::InvalidBallotHash);
+            }
+            let key = DataKey::BallotMetadata(ballot_id_hash.clone());
+            if env.storage().persistent().has(&key) {
+                return Err(ContractError::BallotAlreadyExists);
+            }
+        }
+
+        // ── Phase 2: write all ballots ────────────────────────────────────
+        let now = env.ledger().timestamp();
+        let mut recorded: Vec<String> = Vec::new(&env);
+
+        for i in 0..ballots.len() {
+            let (ballot_id_hash, limits) = ballots.get(i).unwrap();
+            let key = DataKey::BallotMetadata(ballot_id_hash.clone());
+            let metadata = BallotMetadata {
+                admin: caller.clone(),
+                created_at: now,
+                expiration_time: 0,
+                limits,
+                state: BallotState::Active,
+                state_updated_at: now,
+            };
+            env.storage().persistent().set(&key, &metadata);
+            env.storage()
+                .persistent()
+                .set(&DataKey::TokensIssued(ballot_id_hash.clone()), &0u32);
+            env.storage()
+                .persistent()
+                .set(&DataKey::VotesCast(ballot_id_hash.clone()), &0u32);
+            env.events().publish(
+                (symbol_short!("audit"), symbol_short!("blt_crtd")),
+                (ballot_id_hash.clone(), now, caller.clone()),
+            );
+            recorded.push_back(ballot_id_hash);
+        }
+
+        Ok(recorded)
+    }
+
     pub fn record_ballot(
         env: Env,
         caller: Address,
@@ -1586,5 +1645,138 @@ mod tests {
 
         assert!(ts_b > ts_a);
         assert_eq!(ts_b - ts_a, 60);
+    }
+
+    // ── record_ballots_batch tests ────────────────────────────────────────
+
+    #[test]
+    fn batch_records_all_ballots_and_returns_hashes() {
+        let (env, client, admin) = setup();
+        let id_a = String::from_str(&env, "batch-a");
+        let id_b = String::from_str(&env, "batch-b");
+        let id_c = String::from_str(&env, "batch-c");
+
+        let ballots = Vec::from_array(
+            &env,
+            [
+                (id_a.clone(), limits(10, 10)),
+                (id_b.clone(), limits(20, 20)),
+                (id_c.clone(), limits(30, 30)),
+            ],
+        );
+
+        let recorded = client.record_ballots_batch(&admin, &ballots);
+        assert_eq!(recorded.len(), 3);
+        assert_eq!(recorded.get(0).unwrap(), id_a);
+        assert_eq!(recorded.get(1).unwrap(), id_b);
+        assert_eq!(recorded.get(2).unwrap(), id_c);
+
+        // All ballots exist on-chain with correct initial state
+        for id in [&id_a, &id_b, &id_c] {
+            assert!(client.ballot_exists(id));
+            assert_eq!(client.get_tokens_issued(id), Some(0));
+            assert_eq!(client.get_votes_cast(id), Some(0));
+            let meta = client.get_ballot_metadata(id).unwrap();
+            assert_eq!(meta.state, BallotState::Active);
+        }
+    }
+
+    #[test]
+    fn batch_fails_atomically_when_any_ballot_hash_is_empty() {
+        let (env, client, admin) = setup();
+        let id_a = String::from_str(&env, "atomic-a");
+        let empty = String::from_str(&env, "");
+
+        let ballots = Vec::from_array(
+            &env,
+            [
+                (id_a.clone(), limits(10, 10)),
+                (empty, limits(10, 10)),
+            ],
+        );
+
+        assert_eq!(
+            client.try_record_ballots_batch(&admin, &ballots),
+            Err(Ok(ContractError::InvalidBallotHash))
+        );
+
+        // First ballot must NOT have been written (atomic rollback)
+        assert!(!client.ballot_exists(&id_a));
+    }
+
+    #[test]
+    fn batch_fails_atomically_when_any_ballot_already_exists() {
+        let (env, client, admin) = setup();
+        let existing = String::from_str(&env, "already-exists");
+        let new_one = String::from_str(&env, "brand-new");
+
+        // Pre-record the first ballot
+        client.record_ballot(&admin, &existing, &limits(5, 5));
+
+        let ballots = Vec::from_array(
+            &env,
+            [
+                (new_one.clone(), limits(10, 10)),
+                (existing, limits(10, 10)),
+            ],
+        );
+
+        assert_eq!(
+            client.try_record_ballots_batch(&admin, &ballots),
+            Err(Ok(ContractError::BallotAlreadyExists))
+        );
+
+        // new_one must NOT have been written (atomic rollback)
+        assert!(!client.ballot_exists(&new_one));
+    }
+
+    #[test]
+    fn batch_is_rejected_when_contract_is_paused() {
+        let (env, client, admin) = setup();
+
+        // Pause the contract via governance
+        let op_id = client.pause_contract(&admin);
+        client.approve_operation(&op_id, &admin);
+        assert!(client.is_paused());
+
+        let id = String::from_str(&env, "paused-ballot");
+        let ballots = Vec::from_array(&env, [(id, limits(10, 10))]);
+
+        assert_eq!(
+            client.try_record_ballots_batch(&admin, &ballots),
+            Err(Ok(ContractError::ContractPaused))
+        );
+    }
+
+    #[test]
+    fn batch_is_rejected_by_non_admin() {
+        let (env, client, admin) = setup();
+        let non_admin = Address::generate(&env);
+        let id = String::from_str(&env, "unauth-batch");
+        let ballots = Vec::from_array(&env, [(id, limits(10, 10))]);
+
+        // Should be rejected — only admin can record ballots
+        assert_eq!(
+            client.try_record_ballots_batch(&non_admin, &ballots),
+            Err(Ok(ContractError::AdminUnauthorized))
+        );
+    }
+
+    #[test]
+    fn single_item_batch_matches_record_ballot_behavior() {
+        let (env, client, admin) = setup();
+        let id = String::from_str(&env, "single-batch");
+
+        let ballots = Vec::from_array(&env, [(id.clone(), limits(5, 7))]);
+        let recorded = client.record_ballots_batch(&admin, &ballots);
+
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded.get(0).unwrap(), id);
+
+        let meta = client.get_ballot_metadata(&id).unwrap();
+        assert_eq!(meta.limits.max_tokens, 5);
+        assert_eq!(meta.limits.max_votes, 7);
+        assert_eq!(meta.admin, admin);
+        assert_eq!(meta.state, BallotState::Active);
     }
 }

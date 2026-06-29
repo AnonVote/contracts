@@ -20,6 +20,7 @@ import {
   readContract,
   validateSorobanConfig,
   validateContractId,
+  sorobanRecordBallotsBatch,
   sorobanRecordResult,
   sorobanResultExists,
   sorobanVerifyResultProof,
@@ -373,5 +374,91 @@ describe("sorobanGetRotationHistory — unit tests (mocked RPC)", () => {
     mockRpc.simulateTransaction.mockResolvedValueOnce(simulationError("Error(Contract, #3)"));
     const result = await sorobanGetRotationHistory(makeConfig());
     expect(result).toBeNull();
+  });
+});
+
+describe("sorobanRecordBallotsBatch — unit tests (mocked RPC)", () => {
+  const ballots = [
+    { ballotIdHash: "hash-a", limits: { maxTokens: 100, maxVotes: 100 } },
+    { ballotIdHash: "hash-b", limits: { maxTokens: 200, maxVotes: 200 } },
+  ];
+
+  it("returns success and a txHash when simulation and confirmation succeed", async () => {
+    mockRpc.simulateTransaction.mockResolvedValueOnce(simulationSuccess(["hash-a", "hash-b"]));
+    mockRpc.sendTransaction.mockResolvedValueOnce({ status: "PENDING", hash: "tx-batch-1" });
+    mockRpc.getTransaction.mockResolvedValueOnce(txSuccess(["hash-a", "hash-b"]));
+
+    const result = await sorobanRecordBallotsBatch(makeConfig(), ballots);
+    expect(result.success).toBe(true);
+    expect(result.txHash).toBe("tx-batch-1");
+    expect(result.returnValue).toEqual(["hash-a", "hash-b"]);
+  });
+
+  it("returns BallotAlreadyExists when any ballot in the batch already exists", async () => {
+    mockRpc.simulateTransaction.mockResolvedValueOnce(simulationError("Error(Contract, #5)"));
+
+    const result = await sorobanRecordBallotsBatch(makeConfig(), ballots);
+    expect(result.success).toBe(false);
+    expect(result.errorCode).toBe(SorobanErrorCode.BallotAlreadyExists);
+    // Batch rejected at simulation — no transaction sent
+    expect(mockRpc.sendTransaction).not.toHaveBeenCalled();
+  });
+
+  it("returns InvalidBallotHash when any ballot has an empty hash", async () => {
+    mockRpc.simulateTransaction.mockResolvedValueOnce(simulationError("Error(Contract, #8)"));
+
+    const result = await sorobanRecordBallotsBatch(makeConfig(), [
+      { ballotIdHash: "good-hash" },
+      { ballotIdHash: "" },
+    ]);
+    expect(result.success).toBe(false);
+    expect(result.errorCode).toBe(SorobanErrorCode.InvalidBallotHash);
+    expect(mockRpc.sendTransaction).not.toHaveBeenCalled();
+  });
+
+  it("returns ContractPaused when the contract is paused", async () => {
+    mockRpc.simulateTransaction.mockResolvedValueOnce(simulationError("Error(Contract, #13)"));
+
+    const result = await sorobanRecordBallotsBatch(makeConfig(), ballots);
+    expect(result.success).toBe(false);
+    expect(result.errorCode).toBe(SorobanErrorCode.ContractPaused);
+    expect(mockRpc.sendTransaction).not.toHaveBeenCalled();
+  });
+
+  it("returns AdminUnauthorized when caller is not the admin", async () => {
+    mockRpc.simulateTransaction.mockResolvedValueOnce(simulationError("Error(Contract, #1)"));
+
+    const result = await sorobanRecordBallotsBatch(makeConfig(), ballots);
+    expect(result.success).toBe(false);
+    expect(result.errorCode).toBe(SorobanErrorCode.AdminUnauthorized);
+    expect(mockRpc.sendTransaction).not.toHaveBeenCalled();
+  });
+
+  it("returns NotConfigured without calling RPC when the secret key is invalid", async () => {
+    const result = await sorobanRecordBallotsBatch(
+      makeConfig({ stellarSecretKey: "not-a-real-key" }),
+      ballots,
+    );
+    expect(result.success).toBe(false);
+    expect(result.errorCode).toBe(SorobanErrorCode.NotConfigured);
+    expect(mockRpc.simulateTransaction).not.toHaveBeenCalled();
+  });
+
+  it("applies default limits when none are supplied for an entry", async () => {
+    mockRpc.simulateTransaction.mockResolvedValueOnce(simulationSuccess(["hash-default"]));
+    mockRpc.sendTransaction.mockResolvedValueOnce({ status: "PENDING", hash: "tx-default" });
+    mockRpc.getTransaction.mockResolvedValueOnce(txSuccess(["hash-default"]));
+
+    // No limits provided — should fall back to { maxTokens: 10000, maxVotes: 10000 }
+    const result = await sorobanRecordBallotsBatch(makeConfig(), [{ ballotIdHash: "hash-default" }]);
+    expect(result.success).toBe(true);
+  });
+
+  it("returns NetworkError without throwing when the RPC call rejects", async () => {
+    mockRpc.simulateTransaction.mockRejectedValueOnce(new Error("connection refused"));
+
+    const result = await sorobanRecordBallotsBatch(makeConfig(), ballots);
+    expect(result.success).toBe(false);
+    expect(result.errorCode).toBe(SorobanErrorCode.NetworkError);
   });
 });
