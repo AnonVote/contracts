@@ -94,6 +94,39 @@ Once deployed, update `backend/src/services/sorobanService.ts` calls in:
 
 The `ballot_id_hash` argument should be `hashIdentifier(ballotId)` — the same SHA-256 function already used in the backend.
 
+All five service helpers (`sorobanRecordBallot`, `sorobanRecordBallotsBatch`, `sorobanRecordToken`, `sorobanRecordVote`, `sorobanRecordResult`) throw `SorobanServiceError` on any failure. Import it from `service/index.ts` and wrap every call:
+
+```ts
+import { SorobanServiceError } from "@anonvote/contracts/service";
+
+try {
+  await sorobanRecordBallot(config, ballotIdHash);
+} catch (err) {
+  if (err instanceof SorobanServiceError) {
+    if (err.retryable) {
+      // Enqueue for retry with backoff — NETWORK_ERROR and SIMULATION_FAILED
+      // are transient; retrying is safe and expected.
+    } else {
+      // CONTRACT_ERROR or TRANSACTION_FAILED — do not retry.
+      // CONTRACT_ERROR indicates a logic error (e.g. ballot already exists).
+      // Retrying it will always produce the same result.
+    }
+  }
+  throw err;
+}
+```
+
+Error code retryability:
+
+| `SorobanServiceErrorCode` | `retryable` | When thrown                                   |
+| -------------------------- | ----------- | --------------------------------------------- |
+| `NETWORK_ERROR`            | `true`      | RPC endpoint unreachable, DNS failure, TCP reset |
+| `SIMULATION_FAILED`        | `true`      | RPC timeout, overloaded node, no error code   |
+| `TRANSACTION_FAILED`       | `false`     | `sendTransaction` returned ERROR, or tx never confirmed after max retries |
+| `CONTRACT_ERROR`           | `false`     | On-chain logic error (BallotNotFound, BallotAlreadyExists, etc.) |
+
+Full error details (raw RPC responses, contract diagnostics) are logged internally only and are never exposed in the thrown error message, so it is safe to surface `err.message` in structured logs. Do not include raw contract error details in API responses to clients.
+
 ---
 
 ## Milestones
