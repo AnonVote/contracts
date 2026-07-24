@@ -39,6 +39,8 @@ pub enum ContractError {
     OperationNotPending = 20,
     OperationExpired = 21,
     SameAdmin = 22,
+    InternalError = 23,
+    EmptyBallotHash = 24,
 }
 
 #[contracttype]
@@ -452,9 +454,9 @@ impl AnonVoteContract {
 
         // ── Phase 1: validate everything before writing anything ──────────
         for i in 0..ballots.len() {
-            let (ballot_id_hash, _) = ballots.get(i).unwrap();
+            let (ballot_id_hash, _) = ballots.get(i).ok_or(ContractError::InternalError)?;
             if ballot_id_hash.is_empty() {
-                return Err(ContractError::InvalidBallotHash);
+                return Err(ContractError::EmptyBallotHash);
             }
             let key = DataKey::BallotMetadata(ballot_id_hash.clone());
             if env.storage().persistent().has(&key) {
@@ -467,7 +469,7 @@ impl AnonVoteContract {
         let mut recorded: Vec<String> = Vec::new(&env);
 
         for i in 0..ballots.len() {
-            let (ballot_id_hash, limits) = ballots.get(i).unwrap();
+            let (ballot_id_hash, limits) = ballots.get(i).ok_or(ContractError::InternalError)?;
             let key = DataKey::BallotMetadata(ballot_id_hash.clone());
             let metadata = BallotMetadata {
                 admin: caller.clone(),
@@ -832,7 +834,7 @@ impl AnonVoteContract {
         if !env.storage().persistent().has(&result_key) {
             return Err(ContractError::BallotNotFound);
         }
-        let stored_result_hash: String = env.storage().persistent().get(&result_key).unwrap();
+        let stored_result_hash: String = env.storage().persistent().get(&result_key).ok_or(ContractError::InternalError)?;
 
         let mut current_hash = vote_merkle_proof.vote_hash.clone();
         let mut idx = vote_merkle_proof.index;
@@ -1117,7 +1119,8 @@ fn bytes_to_hex(env: &Env, bytes: &BytesN<32>) -> String {
         buf[i * 2] = hex_chars[(byte >> 4) as usize];
         buf[i * 2 + 1] = hex_chars[(byte & 0xf) as usize];
     }
-    let rust_str = core::str::from_utf8(&buf).unwrap();
+    // SAFETY: buf is always valid ASCII hex chars (0-9, a-f), which is valid UTF-8
+    let rust_str = unsafe { core::str::from_utf8_unchecked(&buf) };
     String::from_str(env, rust_str)
 }
 
@@ -1418,7 +1421,7 @@ mod tests {
         assert!(history.get(1).unwrap().rotated_at > history.get(0).unwrap().rotated_at);
     }
 
-    #[test]
+#[test]
     fn ballot_limits_and_counts_still_work() {
         let (env, client, admin) = setup();
         let ballot = String::from_str(&env, "limited");
@@ -1697,7 +1700,7 @@ mod tests {
 
         assert_eq!(
             client.try_record_ballots_batch(&admin, &ballots),
-            Err(Ok(ContractError::InvalidBallotHash))
+            Err(Ok(ContractError::EmptyBallotHash))
         );
 
         // First ballot must NOT have been written (atomic rollback)
