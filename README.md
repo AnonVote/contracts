@@ -54,31 +54,64 @@ cargo test
 
 ---
 
-## Deploy to Testnet
+## Deploy
+
+### Prerequisites
+
+- [Rust](https://rustup.rs/) with the `wasm32-unknown-unknown` target
+- [Stellar CLI](https://github.com/stellar/stellar-cli)
+- `jq` installed
+- A Stellar account funded with testnet/mainnet XLM
+
+### Environment variables
+
+Copy `.env.example` to `.env` and fill in:
 
 ```bash
-# Deploy the contract
-stellar contract deploy \
-  --wasm target/wasm32-unknown-unknown/release/anonvote.wasm \
-  --source SBQE4MLYZGNOQOXHTHHKGR6L6YZ72HTRY6TDDMKS5FMESKPG27O4HK7K \
-  --network testnet
-
-# Output: CONTRACT_ID (e.g. CABC123...)
-# Add to backend/.env:
-# SOROBAN_CONTRACT_ID=CABC123...
+cp .env.example .env
 ```
 
----
+| Variable | Required | Description |
+|---|---|---|
+| `STELLAR_SECRET_KEY` | Yes | Admin secret key for signing the deploy transaction |
+| `SOROBAN_RPC_URL` | No | RPC endpoint — defaults are set per network in `deploy.sh` |
 
-## Initialize after deployment
+### Deploy to testnet
 
 ```bash
-stellar contract invoke \
-  --id <CONTRACT_ID> \
-  --source SBQE4MLYZGNOQOXHTHHKGR6L6YZ72HTRY6TDDMKS5FMESKPG27O4HK7K \
-  --network testnet \
-  -- initialize \
-  --admin GCSL4DBZNKTBNA4FGWFSCWFC4GDCMYAUKD6BISRJHIU4V4K5WVNYOLBN
+source .env
+./deploy.sh testnet
+```
+
+### Deploy to mainnet
+
+```bash
+source .env
+./deploy.sh mainnet
+```
+
+### What the script does
+
+1. Builds the WASM binary
+2. Deploys to the specified Stellar network
+3. Initializes the contract with the derived admin address
+4. Records contract ID, WASM hash, git commit, and timestamp in `deployments.json`
+5. Creates a git tag (`contract-testnet-v1.0.0` or `contract-mainnet-v1.0.0`)
+6. Prints a summary with the contract ID and verification links
+
+### Verifying deployment
+
+Check the contract on Stellar Explorer:
+- Testnet: `https://stellar.expert/explorer/testnet/contract/<CONTRACT_ID>`
+- Mainnet: `https://stellar.expert/explorer/mainnet/contract/<CONTRACT_ID>`
+
+### Pushing to remote
+
+After deployment, push the tag and commit:
+
+```bash
+git push origin contract-testnet-v1.0.0
+git push origin feat/contract-deployment-script
 ```
 
 ---
