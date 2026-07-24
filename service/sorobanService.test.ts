@@ -27,6 +27,8 @@ import {
   sorobanRotateAdmin,
   sorobanGetRotationHistory,
   SorobanErrorCode,
+  SorobanServiceError,
+  SorobanServiceErrorCode,
   DEFAULT_RETRY_POLICY,
   type SorobanConfig,
 } from "./sorobanService";
@@ -220,18 +222,28 @@ describe("sorobanRecordResult — finality guard / idempotency", () => {
       // readContract for get_result_hash returns a DIFFERENT hash
       .mockResolvedValueOnce(simulationSuccess("result-hash-DIFFERENT"));
 
-    const result = await sorobanRecordResult(makeConfig(), "ballot-y", "result-hash-mine");
-    expect(result.success).toBe(false);
-    expect(result.errorCode).toBe(SorobanErrorCode.ResultAlreadyPublished);
+    await expect(
+      sorobanRecordResult(makeConfig(), "ballot-y", "result-hash-mine"),
+    ).rejects.toSatisfy(
+      (err: unknown) =>
+        err instanceof SorobanServiceError &&
+        err.code === SorobanServiceErrorCode.CONTRACT_ERROR &&
+        err.contractErrorCode === SorobanErrorCode.ResultAlreadyPublished,
+    );
     expect(mockRpc.sendTransaction).not.toHaveBeenCalled();
   });
 
   it("propagates non-finality errors (e.g. BallotNotFound) unchanged", async () => {
     mockRpc.simulateTransaction.mockResolvedValueOnce(simulationError("Error(Contract, #4)"));
 
-    const result = await sorobanRecordResult(makeConfig(), "missing-ballot", "hash");
-    expect(result.success).toBe(false);
-    expect(result.errorCode).toBe(SorobanErrorCode.BallotNotFound);
+    await expect(
+      sorobanRecordResult(makeConfig(), "missing-ballot", "hash"),
+    ).rejects.toSatisfy(
+      (err: unknown) =>
+        err instanceof SorobanServiceError &&
+        err.code === SorobanServiceErrorCode.CONTRACT_ERROR &&
+        err.contractErrorCode === SorobanErrorCode.BallotNotFound,
+    );
   });
 });
 
@@ -397,9 +409,14 @@ describe("sorobanRecordBallotsBatch — unit tests (mocked RPC)", () => {
   it("returns BallotAlreadyExists when any ballot in the batch already exists", async () => {
     mockRpc.simulateTransaction.mockResolvedValueOnce(simulationError("Error(Contract, #5)"));
 
-    const result = await sorobanRecordBallotsBatch(makeConfig(), ballots);
-    expect(result.success).toBe(false);
-    expect(result.errorCode).toBe(SorobanErrorCode.BallotAlreadyExists);
+    await expect(
+      sorobanRecordBallotsBatch(makeConfig(), ballots),
+    ).rejects.toSatisfy(
+      (err: unknown) =>
+        err instanceof SorobanServiceError &&
+        err.code === SorobanServiceErrorCode.CONTRACT_ERROR &&
+        err.contractErrorCode === SorobanErrorCode.BallotAlreadyExists,
+    );
     // Batch rejected at simulation — no transaction sent
     expect(mockRpc.sendTransaction).not.toHaveBeenCalled();
   });
@@ -407,30 +424,45 @@ describe("sorobanRecordBallotsBatch — unit tests (mocked RPC)", () => {
   it("returns InvalidBallotHash when any ballot has an empty hash", async () => {
     mockRpc.simulateTransaction.mockResolvedValueOnce(simulationError("Error(Contract, #8)"));
 
-    const result = await sorobanRecordBallotsBatch(makeConfig(), [
-      { ballotIdHash: "good-hash" },
-      { ballotIdHash: "" },
-    ]);
-    expect(result.success).toBe(false);
-    expect(result.errorCode).toBe(SorobanErrorCode.InvalidBallotHash);
+    await expect(
+      sorobanRecordBallotsBatch(makeConfig(), [
+        { ballotIdHash: "good-hash" },
+        { ballotIdHash: "" },
+      ]),
+    ).rejects.toSatisfy(
+      (err: unknown) =>
+        err instanceof SorobanServiceError &&
+        err.code === SorobanServiceErrorCode.CONTRACT_ERROR &&
+        err.contractErrorCode === SorobanErrorCode.InvalidBallotHash,
+    );
     expect(mockRpc.sendTransaction).not.toHaveBeenCalled();
   });
 
   it("returns ContractPaused when the contract is paused", async () => {
     mockRpc.simulateTransaction.mockResolvedValueOnce(simulationError("Error(Contract, #13)"));
 
-    const result = await sorobanRecordBallotsBatch(makeConfig(), ballots);
-    expect(result.success).toBe(false);
-    expect(result.errorCode).toBe(SorobanErrorCode.ContractPaused);
+    await expect(
+      sorobanRecordBallotsBatch(makeConfig(), ballots),
+    ).rejects.toSatisfy(
+      (err: unknown) =>
+        err instanceof SorobanServiceError &&
+        err.code === SorobanServiceErrorCode.CONTRACT_ERROR &&
+        err.contractErrorCode === SorobanErrorCode.ContractPaused,
+    );
     expect(mockRpc.sendTransaction).not.toHaveBeenCalled();
   });
 
   it("returns AdminUnauthorized when caller is not the admin", async () => {
     mockRpc.simulateTransaction.mockResolvedValueOnce(simulationError("Error(Contract, #1)"));
 
-    const result = await sorobanRecordBallotsBatch(makeConfig(), ballots);
-    expect(result.success).toBe(false);
-    expect(result.errorCode).toBe(SorobanErrorCode.AdminUnauthorized);
+    await expect(
+      sorobanRecordBallotsBatch(makeConfig(), ballots),
+    ).rejects.toSatisfy(
+      (err: unknown) =>
+        err instanceof SorobanServiceError &&
+        err.code === SorobanServiceErrorCode.CONTRACT_ERROR &&
+        err.contractErrorCode === SorobanErrorCode.AdminUnauthorized,
+    );
     expect(mockRpc.sendTransaction).not.toHaveBeenCalled();
   });
 
@@ -457,8 +489,13 @@ describe("sorobanRecordBallotsBatch — unit tests (mocked RPC)", () => {
   it("returns NetworkError without throwing when the RPC call rejects", async () => {
     mockRpc.simulateTransaction.mockRejectedValueOnce(new Error("connection refused"));
 
-    const result = await sorobanRecordBallotsBatch(makeConfig(), ballots);
-    expect(result.success).toBe(false);
-    expect(result.errorCode).toBe(SorobanErrorCode.NetworkError);
+    await expect(
+      sorobanRecordBallotsBatch(makeConfig(), ballots),
+    ).rejects.toSatisfy(
+      (err: unknown) =>
+        err instanceof SorobanServiceError &&
+        err.code === SorobanServiceErrorCode.NETWORK_ERROR &&
+        err.retryable === true,
+    );
   });
 });

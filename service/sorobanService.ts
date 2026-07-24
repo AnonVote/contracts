@@ -24,6 +24,121 @@ import * as StellarSdk from "stellar-sdk";
 const SOROBAN_RPC_TESTNET = "https://soroban-testnet.stellar.org";
 const SOROBAN_RPC_MAINNET = "https://rpc.stellar.org";
 
+// ── SorobanServiceError — throwable typed error for callers ──────────────────
+
+/**
+ * Error codes for the throwable SorobanServiceError.
+ * Distinct from SorobanErrorCode (which mirrors on-chain contract codes) —
+ * these four codes represent the service-level failure categories callers
+ * need to distinguish for retry/alerting decisions.
+ *
+ * Retryability:
+ *   NETWORK_ERROR        → true  (transient — network glitch, DNS, TCP reset)
+ *   SIMULATION_FAILED    → true  (transient — RPC timeout, overloaded node)
+ *   TRANSACTION_FAILED   → false (requires investigation; may be idempotent)
+ *   CONTRACT_ERROR       → false (logic error in the call; retry is wrong)
+ */
+export enum SorobanServiceErrorCode {
+  NETWORK_ERROR      = "NETWORK_ERROR",
+  CONTRACT_ERROR     = "CONTRACT_ERROR",
+  SIMULATION_FAILED  = "SIMULATION_FAILED",
+  TRANSACTION_FAILED = "TRANSACTION_FAILED",
+}
+
+/**
+ * Retryable flag per service error code.
+ * Network errors and simulation timeouts are transient — callers should retry
+ * them (with backoff). Contract logic errors and transaction failures are
+ * deterministic — retrying them will produce the same result.
+ */
+export const SOROBAN_SERVICE_ERROR_RETRYABLE: Record<SorobanServiceErrorCode, boolean> = {
+  [SorobanServiceErrorCode.NETWORK_ERROR]:      true,
+  [SorobanServiceErrorCode.SIMULATION_FAILED]:  true,
+  [SorobanServiceErrorCode.TRANSACTION_FAILED]: false,
+  [SorobanServiceErrorCode.CONTRACT_ERROR]:     false,
+};
+
+/**
+ * Typed throwable error surfaced by all AnonVote Soroban service helpers.
+ *
+ * `code`      — service-level failure category (see SorobanServiceErrorCode)
+ * `retryable` — true when the failure is transient and retrying with backoff
+ *               is safe; false when retrying would produce the same result
+ * `contractErrorCode` — the underlying on-chain contract error code when
+ *               `code === CONTRACT_ERROR`, undefined otherwise; intended for
+ *               internal logging only — do not surface in API responses
+ *
+ * @example
+ * ```ts
+ * try {
+ *   await sorobanRecordBallot(config, ballotIdHash);
+ * } catch (err) {
+ *   if (err instanceof SorobanServiceError && err.retryable) {
+ *     // enqueue for retry
+ *   }
+ * }
+ * ```
+ */
+export class SorobanServiceError extends Error {
+  readonly code: SorobanServiceErrorCode;
+  readonly retryable: boolean;
+  /** On-chain contract error code — for internal logging only. */
+  readonly contractErrorCode?: SorobanErrorCode;
+
+  constructor(
+    code: SorobanServiceErrorCode,
+    message: string,
+    contractErrorCode?: SorobanErrorCode,
+  ) {
+    super(message);
+    this.name = "SorobanServiceError";
+    this.code = code;
+    this.retryable = SOROBAN_SERVICE_ERROR_RETRYABLE[code];
+    this.contractErrorCode = contractErrorCode;
+    // Ensure instanceof works correctly when transpiled to ES5
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+/**
+ * Map a failed SorobanInvokeResult onto a SorobanServiceError and throw it.
+ * Called by all public helpers after a non-success result from invokeContract.
+ * Logs full internal details before throwing — callers should NOT log these
+ * details in API responses.
+ */
+function throwFromInvokeResult(method: string, result: SorobanInvokeResult): never {
+  const { errorCode, errorMessage } = result;
+  // Internal log — full details are safe here, not exposed to clients
+  console.error(
+    `[Soroban] ${method} threw SorobanServiceError — code: ${errorCode !== undefined ? SorobanErrorCode[errorCode] : "unknown"}, message: ${errorMessage ?? "(none)"}`,
+  );
+
+  if (errorCode === SorobanErrorCode.NetworkError) {
+    throw new SorobanServiceError(
+      SorobanServiceErrorCode.NETWORK_ERROR,
+      "Stellar network or RPC endpoint is unavailable",
+    );
+  }
+  if (errorCode === SorobanErrorCode.SimulationFailed) {
+    throw new SorobanServiceError(
+      SorobanServiceErrorCode.SIMULATION_FAILED,
+      "Transaction simulation failed — the RPC node may be overloaded",
+    );
+  }
+  if (errorCode === SorobanErrorCode.TransactionFailed) {
+    throw new SorobanServiceError(
+      SorobanServiceErrorCode.TRANSACTION_FAILED,
+      "Transaction submission or confirmation failed",
+    );
+  }
+  // All other codes (contract logic errors: BallotNotFound, BallotAlreadyExists, etc.)
+  throw new SorobanServiceError(
+    SorobanServiceErrorCode.CONTRACT_ERROR,
+    errorMessage ?? "Contract call failed",
+    errorCode,
+  );
+}
+
 // ── Error codes matching ContractError enum in lib.rs ─────────────────────────
 
 export enum SorobanErrorCode {
@@ -732,10 +847,8 @@ export async function sorobanRecordBallot(
       type: "map",
     },
   ]);
-  if (!result.success && result.errorCode !== undefined) {
-    console.error(
-      `[Soroban] sorobanRecordBallot failed — ${SorobanErrorCode[result.errorCode]}: ${result.errorMessage}`,
-    );
+  if (!result.success) {
+    throwFromInvokeResult("sorobanRecordBallot", result);
   }
   return result;
 }
@@ -780,10 +893,8 @@ export async function sorobanRecordBallotsBatch(
     { value: ballotsArg, type: "vec" },
   ]);
 
-  if (!result.success && result.errorCode !== undefined) {
-    console.error(
-      `[Soroban] sorobanRecordBallotsBatch failed — ${SorobanErrorCode[result.errorCode]}: ${result.errorMessage}`,
-    );
+  if (!result.success) {
+    throwFromInvokeResult("sorobanRecordBallotsBatch", result);
   }
 
   return result;
@@ -808,15 +919,7 @@ export async function sorobanRecordToken(
     { value: ballotIdHash, type: "string" },
   ]);
   if (!result.success) {
-    if (result.errorCode === SorobanErrorCode.BallotNotFound) {
-      console.error(
-        `[Soroban] sorobanRecordToken: ballot ${ballotIdHash} not found on-chain — BallotNotFound`,
-      );
-    } else if (result.errorCode !== undefined) {
-      console.error(
-        `[Soroban] sorobanRecordToken failed — ${SorobanErrorCode[result.errorCode]}: ${result.errorMessage}`,
-      );
-    }
+    throwFromInvokeResult("sorobanRecordToken", result);
   }
   return result;
 }
@@ -840,15 +943,7 @@ export async function sorobanRecordVote(
     { value: ballotIdHash, type: "string" },
   ]);
   if (!result.success) {
-    if (result.errorCode === SorobanErrorCode.BallotNotFound) {
-      console.error(
-        `[Soroban] sorobanRecordVote: ballot ${ballotIdHash} not found on-chain — BallotNotFound`,
-      );
-    } else if (result.errorCode !== undefined) {
-      console.error(
-        `[Soroban] sorobanRecordVote failed — ${SorobanErrorCode[result.errorCode]}: ${result.errorMessage}`,
-      );
-    }
+    throwFromInvokeResult("sorobanRecordVote", result);
   }
   return result;
 }
@@ -887,16 +982,15 @@ export async function sorobanRecordResult(
       );
       return { txHash: "", success: true, returnValue: onChainHash };
     }
+    // Conflicting result — not retryable, log internally and throw
     console.error(
       `[Soroban] sorobanRecordResult: conflicting result already published for ballot ${ballotIdHash}`,
     );
-    return result;
+    throwFromInvokeResult("sorobanRecordResult", result);
   }
 
-  if (!result.success && result.errorCode !== undefined) {
-    console.error(
-      `[Soroban] sorobanRecordResult failed — ${SorobanErrorCode[result.errorCode]}: ${result.errorMessage}`,
-    );
+  if (!result.success) {
+    throwFromInvokeResult("sorobanRecordResult", result);
   }
   return result;
 }
