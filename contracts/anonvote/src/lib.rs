@@ -808,6 +808,16 @@ impl AnonVoteContract {
     }
 
     pub fn is_consistent(env: Env, ballot_id_hash: String) -> bool {
+        // A non-existent ballot is never consistent — returning false lets
+        // callers safely poll before record_ballot has been called without
+        // treating the phantom 0==0 case as a valid audit confirmation.
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::BallotMetadata(ballot_id_hash.clone()))
+        {
+            return false;
+        }
         let tokens: u32 = env
             .storage()
             .persistent()
@@ -1778,5 +1788,68 @@ mod tests {
         assert_eq!(meta.limits.max_votes, 7);
         assert_eq!(meta.admin, admin);
         assert_eq!(meta.state, BallotState::Active);
+    }
+
+    // ── issue #75: ballot existence guard tests ───────────────────────────
+
+    #[test]
+    fn record_token_on_non_existent_ballot_returns_ballot_not_found() {
+        let (env, client, admin) = setup();
+        let phantom = String::from_str(&env, "phantom-ballot-token");
+        assert_eq!(
+            client.try_record_token(&admin, &phantom),
+            Err(Ok(ContractError::BallotNotFound))
+        );
+    }
+
+    #[test]
+    fn record_vote_on_non_existent_ballot_returns_ballot_not_found() {
+        let (env, client, admin) = setup();
+        let phantom = String::from_str(&env, "phantom-ballot-vote");
+        assert_eq!(
+            client.try_record_vote(&admin, &phantom),
+            Err(Ok(ContractError::BallotNotFound))
+        );
+    }
+
+    #[test]
+    fn record_result_on_non_existent_ballot_returns_ballot_not_found() {
+        let (env, client, admin) = setup();
+        let phantom = String::from_str(&env, "phantom-ballot-result");
+        let result = String::from_str(&env, "some-result-hash");
+        assert_eq!(
+            client.try_record_result(&admin, &phantom, &result),
+            Err(Ok(ContractError::BallotNotFound))
+        );
+    }
+
+    #[test]
+    fn happy_path_record_ballot_then_token_vote_result_all_succeed() {
+        let (env, client, admin) = setup();
+        let ballot = String::from_str(&env, "happy-path-ballot");
+        let result = String::from_str(&env, "happy-path-result-hash");
+
+        // Register ballot first
+        client.record_ballot(&admin, &ballot, &limits(10, 10));
+
+        // All three subsequent operations must succeed
+        client.record_token(&admin, &ballot);
+        client.record_vote(&admin, &ballot);
+
+        assert_eq!(client.get_tokens_issued(&ballot), Some(1));
+        assert_eq!(client.get_votes_cast(&ballot), Some(1));
+        assert!(client.is_consistent(&ballot));
+
+        let op_id = client.record_result(&admin, &ballot, &result);
+        client.approve_operation(&op_id, &admin);
+        assert_eq!(client.get_result_hash(&ballot), Some(result));
+    }
+
+    #[test]
+    fn is_consistent_returns_false_for_non_existent_ballot() {
+        let (env, client, _admin) = setup();
+        let phantom = String::from_str(&env, "phantom-ballot-consistent");
+        // Must be false, not true (0 == 0 should not be a valid audit pass).
+        assert!(!client.is_consistent(&phantom));
     }
 }
