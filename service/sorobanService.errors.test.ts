@@ -24,6 +24,7 @@ vi.mock("stellar-sdk", async () => {
 });
 
 // Imported after vi.mock so the service picks up the mocked stellar-sdk.
+import * as StellarSdk from "stellar-sdk";
 import {
   SorobanServiceError,
   SorobanServiceErrorCode,
@@ -43,9 +44,10 @@ const VALID_CONTRACT_ID = "C" + "D".repeat(55);
 
 function makeConfig(overrides: Partial<SorobanConfig> = {}): SorobanConfig {
   return {
-    stellarSecretKey: VALID_SECRET_KEY,
-    stellarNetwork: "testnet",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    networkPassphrase: "Test SDF Network ; September 2015",
     contractId: VALID_CONTRACT_ID,
+    sourceKeypair: StellarSdk.Keypair.fromSecret(VALID_SECRET_KEY),
     ...overrides,
   };
 }

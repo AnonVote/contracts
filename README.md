@@ -72,9 +72,10 @@ cp .env.example .env
 ```
 
 | Variable | Required | Description |
-|---|---|---|
+|---|---|---|---|
 | `STELLAR_SECRET_KEY` | Yes | Admin secret key for signing the deploy transaction |
-| `SOROBAN_RPC_URL` | No | RPC endpoint — defaults are set per network in `deploy.sh` |
+| `SOROBAN_RPC_URL_TESTNET` | No | Testnet RPC endpoint — defaults to `https://soroban-testnet.stellar.org` |
+| `SOROBAN_RPC_URL_MAINNET` | No | Mainnet RPC endpoint — defaults to `https://soroban-mainnet.stellar.org` |
 
 ### Deploy to testnet
 
@@ -127,13 +128,67 @@ Once deployed, update `backend/src/services/sorobanService.ts` calls in:
 
 The `ballot_id_hash` argument should be `hashIdentifier(ballotId)` — the same SHA-256 function already used in the backend.
 
-All five service helpers (`sorobanRecordBallot`, `sorobanRecordBallotsBatch`, `sorobanRecordToken`, `sorobanRecordVote`, `sorobanRecordResult`) throw `SorobanServiceError` on any failure. Import it from `service/index.ts` and wrap every call:
+## Usage
+
+### Factory API (recommended)
+
+The preferred way to use the service is via the `createSorobanService` factory, which creates an object with all methods pre-bound to a config:
+
+```ts
+import { Keypair } from "stellar-sdk";
+import { createSorobanService, createDefaultTestnetConfig } from "@anonvote/contracts/service";
+
+const sourceKeypair = Keypair.fromSecret(process.env.STELLAR_SECRET_KEY!);
+const config = createDefaultTestnetConfig({
+  contractId: process.env.SOROBAN_CONTRACT_ID!,
+  sourceKeypair,
+});
+const service = createSorobanService(config);
+
+await service.sorobanRecordBallot("hash123");
+```
+
+### Config helpers
+
+```ts
+// Testnet — defaults to https://soroban-testnet.stellar.org
+const testnetConfig = createDefaultTestnetConfig({ contractId, sourceKeypair });
+
+// Mainnet — defaults to https://soroban-mainnet.stellar.org
+const mainnetConfig = createDefaultMainnetConfig({ contractId, sourceKeypair });
+
+// Override any field for custom RPC gateways or local dev nodes:
+const customConfig = { ...testnetConfig, rpcUrl: "http://localhost:8000" };
+```
+
+### Module-level API (low-level)
+
+The module-level functions are still exported for callers who need to pass config dynamically:
+
+```ts
+import { SorobanServiceError, sorobanRecordBallot } from "@anonvote/contracts/service";
+
+try {
+  await sorobanRecordBallot(config, ballotIdHash);
+} catch (err) {
+  if (err instanceof SorobanServiceError) {
+    if (err.retryable) {
+      // Enqueue for retry with backoff
+    }
+  }
+  throw err;
+}
+```
+
+### Error handling
+
+All service helpers throw `SorobanServiceError` on failure. Import it from `service/index.ts` and wrap every call:
 
 ```ts
 import { SorobanServiceError } from "@anonvote/contracts/service";
 
 try {
-  await sorobanRecordBallot(config, ballotIdHash);
+  await service.sorobanRecordBallot(ballotIdHash);
 } catch (err) {
   if (err instanceof SorobanServiceError) {
     if (err.retryable) {
@@ -142,7 +197,6 @@ try {
     } else {
       // CONTRACT_ERROR or TRANSACTION_FAILED — do not retry.
       // CONTRACT_ERROR indicates a logic error (e.g. ballot already exists).
-      // Retrying it will always produce the same result.
     }
   }
   throw err;
