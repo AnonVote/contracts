@@ -39,6 +39,8 @@ pub enum ContractError {
     OperationNotPending = 20,
     OperationExpired = 21,
     SameAdmin = 22,
+    InvalidBallotIdHash = 23,
+    InvalidResultHash = 24,
 }
 
 #[contracttype]
@@ -305,6 +307,12 @@ impl AnonVoteContract {
         ballot_id_hash: String,
         result_hash: String,
     ) -> Result<u64, ContractError> {
+        if !is_valid_sha256_hex(&ballot_id_hash) {
+            return Err(ContractError::InvalidBallotIdHash);
+        }
+        if !is_valid_sha256_hex(&result_hash) {
+            return Err(ContractError::InvalidResultHash);
+        }
         Self::create_operation(
             env,
             caller,
@@ -453,8 +461,8 @@ impl AnonVoteContract {
         // ── Phase 1: validate everything before writing anything ──────────
         for i in 0..ballots.len() {
             let (ballot_id_hash, _) = ballots.get(i).unwrap();
-            if ballot_id_hash.is_empty() {
-                return Err(ContractError::InvalidBallotHash);
+            if !is_valid_sha256_hex(&ballot_id_hash) {
+                return Err(ContractError::InvalidBallotIdHash);
             }
             let key = DataKey::BallotMetadata(ballot_id_hash.clone());
             if env.storage().persistent().has(&key) {
@@ -501,8 +509,8 @@ impl AnonVoteContract {
         caller.require_auth();
         Self::require_not_paused(&env)?;
         Self::require_admin(&env, &caller)?;
-        if ballot_id_hash.is_empty() {
-            return Err(ContractError::InvalidBallotHash);
+        if !is_valid_sha256_hex(&ballot_id_hash) {
+            return Err(ContractError::InvalidBallotIdHash);
         }
 
         let metadata_key = DataKey::BallotMetadata(ballot_id_hash.clone());
@@ -1126,6 +1134,30 @@ impl AnonVoteContract {
     }
 }
 
+/// Returns `true` iff `s` is exactly 64 lowercase hexadecimal characters
+/// (`[0-9a-f]`), as produced by a SHA-256 hash function.
+///
+/// Uppercase hex is explicitly rejected: `hashIdentifier` in
+/// `@anonvote/crypto` always outputs lowercase, and storing uppercase
+/// would silently break independent verification.
+fn is_valid_sha256_hex(s: &String) -> bool {
+    if s.len() != 64 {
+        return false;
+    }
+    let mut buf = [0u8; 64];
+    s.copy_into_slice(&mut buf);
+    let mut i = 0usize;
+    while i < 64 {
+        let b = buf[i];
+        let valid = (b >= b'0' && b <= b'9') || (b >= b'a' && b <= b'f');
+        if !valid {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 fn bytes_to_hex(env: &Env, bytes: &BytesN<32>) -> String {
     let arr = bytes.to_array();
     let mut buf = [0u8; 64];
@@ -1143,6 +1175,18 @@ fn bytes_to_hex(env: &Env, bytes: &BytesN<32>) -> String {
 mod tests {
     use super::*;
     use soroban_sdk::testutils::{Address as _, Ledger};
+
+    // Valid 64-char lowercase hex strings used as ballot / result hashes in tests.
+    // Each is a real SHA-256 hex digest so they pass is_valid_sha256_hex().
+    const BALLOT_A: &str = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+    const BALLOT_B: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const BALLOT_C: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+    const BALLOT_D: &str = "3333333333333333333333333333333333333333333333333333333333333333";
+    const BALLOT_E: &str = "4444444444444444444444444444444444444444444444444444444444444444";
+    const BALLOT_F: &str = "5555555555555555555555555555555555555555555555555555555555555555";
+    const BALLOT_G: &str = "6666666666666666666666666666666666666666666666666666666666666666";
+    const RESULT_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const RESULT_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     fn setup() -> (Env, AnonVoteContractClient<'static>, Address) {
         let env = Env::default();
@@ -1186,7 +1230,7 @@ mod tests {
     #[test]
     fn contract_is_valid_after_initialization() {
         let (env, client, admin) = setup();
-        let ballot = String::from_str(&env, "initialized");
+        let ballot = String::from_str(&env, BALLOT_A);
         client.record_ballot(&admin, &ballot, &limits(10, 10));
         assert_eq!(client.get_admin(), Some(admin));
         assert_eq!(client.get_tokens_issued(&ballot), Some(0));
@@ -1195,7 +1239,7 @@ mod tests {
     #[test]
     fn write_operations_reject_uninitialized_contract() {
         let (env, client, admin, _) = setup_uninitialized();
-        let ballot = String::from_str(&env, "uninitialized");
+        let ballot = String::from_str(&env, BALLOT_A);
         let approver = Address::generate(&env);
 
         assert_eq!(
@@ -1228,7 +1272,7 @@ mod tests {
             env.storage().instance().set(&DataKey::Admin, &admin);
         });
 
-        let ballot = String::from_str(&env, "partial");
+        let ballot = String::from_str(&env, BALLOT_A);
         assert_eq!(
             client.try_record_ballot(&admin, &ballot, &limits(1, 1)),
             Err(Ok(ContractError::NotInitialized))
@@ -1239,8 +1283,8 @@ mod tests {
     fn insufficient_approvals_block_result_publication() {
         let (env, client, admin) = setup();
         let (first, second, _) = configure_two_of_three(&env, &client, &admin);
-        let ballot = String::from_str(&env, "ballot");
-        let result = String::from_str(&env, "result");
+        let ballot = String::from_str(&env, BALLOT_A);
+        let result = String::from_str(&env, RESULT_A);
         client.record_ballot(&admin, &ballot, &limits(10, 10));
 
         let operation_id = client.record_result(&admin, &ballot, &result);
@@ -1439,7 +1483,7 @@ mod tests {
     #[test]
     fn ballot_limits_and_counts_still_work() {
         let (env, client, admin) = setup();
-        let ballot = String::from_str(&env, "limited");
+        let ballot = String::from_str(&env, BALLOT_A);
         client.record_ballot(&admin, &ballot, &limits(1, 1));
         client.record_token(&admin, &ballot);
         client.record_vote(&admin, &ballot);
@@ -1455,7 +1499,7 @@ mod tests {
     #[test]
     fn ballot_audit_report_works() {
         let (env, client, admin) = setup();
-        let ballot = String::from_str(&env, "audit-ballot");
+        let ballot = String::from_str(&env, BALLOT_A);
         
         // Report for non-existent ballot should be None
         assert_eq!(client.get_audit_report(&ballot), None);
@@ -1493,7 +1537,7 @@ mod tests {
         assert!(!report3.is_consistent);
 
         // Publish result
-        let result = String::from_str(&env, "election-result");
+        let result = String::from_str(&env, RESULT_A);
         let operation_id = client.record_result(&admin, &ballot, &result);
         client.approve_operation(&operation_id, &admin);
 
@@ -1505,7 +1549,7 @@ mod tests {
     #[test]
     fn verify_result_proof_works() {
         let (env, client, admin) = setup();
-        let ballot = String::from_str(&env, "merkle-ballot");
+        let ballot = String::from_str(&env, BALLOT_A);
         client.record_ballot(&admin, &ballot, &limits(10, 10));
 
         let leaf0_bytes = [1u8; 32];
@@ -1545,7 +1589,7 @@ mod tests {
 
         // Verify valid proof for a single-node tree (empty path, leaf is root)
         let single_root_hex = bytes_to_hex(&env, &leaf0);
-        let ballot_single = String::from_str(&env, "single-node-ballot");
+        let ballot_single = String::from_str(&env, BALLOT_B);
         client.record_ballot(&admin, &ballot_single, &limits(10, 10));
         let op_id_single = client.record_result(&admin, &ballot_single, &single_root_hex);
         client.approve_operation(&op_id_single, &admin);
@@ -1586,7 +1630,7 @@ mod tests {
         assert!(!client.verify_result_proof(&ballot, &proof0, &wrong_root_hex));
 
         // Verify non-existent ballot
-        let non_existent_ballot = String::from_str(&env, "non-existent-ballot");
+        let non_existent_ballot = String::from_str(&env, BALLOT_C);
         let res = client.try_verify_result_proof(&non_existent_ballot, &proof0, &root_hex);
         assert_eq!(res, Err(Ok(ContractError::BallotNotFound)));
     }
@@ -1594,7 +1638,7 @@ mod tests {
     #[test]
     fn get_ballot_created_at_returns_timestamp_set_at_creation() {
         let (env, client, admin) = setup();
-        let ballot = String::from_str(&env, "ts-ballot");
+        let ballot = String::from_str(&env, BALLOT_A);
 
         // Before creation: returns None
         assert_eq!(client.get_ballot_created_at(&ballot), None);
@@ -1610,7 +1654,7 @@ mod tests {
     #[test]
     fn get_ballot_created_at_is_immutable_after_state_changes() {
         let (env, client, admin) = setup();
-        let ballot = String::from_str(&env, "immutable-ts-ballot");
+        let ballot = String::from_str(&env, BALLOT_A);
 
         client.record_ballot(&admin, &ballot, &limits(10, 10));
         let creation_time = client.get_ballot_created_at(&ballot).unwrap();
@@ -1625,7 +1669,7 @@ mod tests {
 
         // Advance again and publish result; timestamp still unchanged
         env.ledger().with_mut(|l| l.timestamp += 100);
-        let result = String::from_str(&env, "result-hash");
+        let result = String::from_str(&env, RESULT_A);
         let op_id = client.record_result(&admin, &ballot, &result);
         client.approve_operation(&op_id, &admin);
 
@@ -1635,7 +1679,7 @@ mod tests {
     #[test]
     fn get_ballot_created_at_matches_metadata_and_audit_report() {
         let (env, client, admin) = setup();
-        let ballot = String::from_str(&env, "cross-check-ballot");
+        let ballot = String::from_str(&env, BALLOT_A);
 
         client.record_ballot(&admin, &ballot, &limits(10, 10));
 
@@ -1650,8 +1694,8 @@ mod tests {
     #[test]
     fn ballots_created_at_different_ledger_times_have_distinct_timestamps() {
         let (env, client, admin) = setup();
-        let ballot_a = String::from_str(&env, "ballot-a");
-        let ballot_b = String::from_str(&env, "ballot-b");
+        let ballot_a = String::from_str(&env, BALLOT_A);
+        let ballot_b = String::from_str(&env, BALLOT_B);
 
         client.record_ballot(&admin, &ballot_a, &limits(10, 10));
         let ts_a = client.get_ballot_created_at(&ballot_a).unwrap();
@@ -1670,9 +1714,9 @@ mod tests {
     #[test]
     fn batch_records_all_ballots_and_returns_hashes() {
         let (env, client, admin) = setup();
-        let id_a = String::from_str(&env, "batch-a");
-        let id_b = String::from_str(&env, "batch-b");
-        let id_c = String::from_str(&env, "batch-c");
+        let id_a = String::from_str(&env, BALLOT_A);
+        let id_b = String::from_str(&env, BALLOT_B);
+        let id_c = String::from_str(&env, BALLOT_C);
 
         let ballots = Vec::from_array(
             &env,
@@ -1702,7 +1746,7 @@ mod tests {
     #[test]
     fn batch_fails_atomically_when_any_ballot_hash_is_empty() {
         let (env, client, admin) = setup();
-        let id_a = String::from_str(&env, "atomic-a");
+        let id_a = String::from_str(&env, BALLOT_A);
         let empty = String::from_str(&env, "");
 
         let ballots = Vec::from_array(
@@ -1715,7 +1759,7 @@ mod tests {
 
         assert_eq!(
             client.try_record_ballots_batch(&admin, &ballots),
-            Err(Ok(ContractError::InvalidBallotHash))
+            Err(Ok(ContractError::InvalidBallotIdHash))
         );
 
         // First ballot must NOT have been written (atomic rollback)
@@ -1725,8 +1769,8 @@ mod tests {
     #[test]
     fn batch_fails_atomically_when_any_ballot_already_exists() {
         let (env, client, admin) = setup();
-        let existing = String::from_str(&env, "already-exists");
-        let new_one = String::from_str(&env, "brand-new");
+        let existing = String::from_str(&env, BALLOT_A);
+        let new_one = String::from_str(&env, BALLOT_B);
 
         // Pre-record the first ballot
         client.record_ballot(&admin, &existing, &limits(5, 5));
@@ -1757,7 +1801,7 @@ mod tests {
         client.approve_operation(&op_id, &admin);
         assert!(client.is_paused());
 
-        let id = String::from_str(&env, "paused-ballot");
+        let id = String::from_str(&env, BALLOT_A);
         let ballots = Vec::from_array(&env, [(id, limits(10, 10))]);
 
         assert_eq!(
@@ -1770,7 +1814,7 @@ mod tests {
     fn batch_is_rejected_by_non_admin() {
         let (env, client, admin) = setup();
         let non_admin = Address::generate(&env);
-        let id = String::from_str(&env, "unauth-batch");
+        let id = String::from_str(&env, BALLOT_A);
         let ballots = Vec::from_array(&env, [(id, limits(10, 10))]);
 
         // Should be rejected — only admin can record ballots
@@ -1783,7 +1827,7 @@ mod tests {
     #[test]
     fn single_item_batch_matches_record_ballot_behavior() {
         let (env, client, admin) = setup();
-        let id = String::from_str(&env, "single-batch");
+        let id = String::from_str(&env, BALLOT_A);
 
         let ballots = Vec::from_array(&env, [(id.clone(), limits(5, 7))]);
         let recorded = client.record_ballots_batch(&admin, &ballots);
