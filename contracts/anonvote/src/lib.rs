@@ -468,7 +468,7 @@ impl AnonVoteContract {
 
         for i in 0..ballots.len() {
             let (ballot_id_hash, limits) = ballots.get(i).unwrap();
-            let key = DataKey::BallotMetadata(ballot_id_hash.clone());
+            let metadata_key = DataKey::BallotMetadata(ballot_id_hash.clone());
             let metadata = BallotMetadata {
                 admin: caller.clone(),
                 created_at: now,
@@ -477,13 +477,11 @@ impl AnonVoteContract {
                 state: BallotState::Active,
                 state_updated_at: now,
             };
-            env.storage().persistent().set(&key, &metadata);
-            env.storage()
-                .persistent()
-                .set(&DataKey::TokensIssued(ballot_id_hash.clone()), &0u32);
-            env.storage()
-                .persistent()
-                .set(&DataKey::VotesCast(ballot_id_hash.clone()), &0u32);
+            env.storage().persistent().set(&metadata_key, &metadata);
+            let tokens_key = DataKey::TokensIssued(ballot_id_hash.clone());
+            let votes_key = DataKey::VotesCast(ballot_id_hash.clone());
+            env.storage().persistent().set(&tokens_key, &0u32);
+            env.storage().persistent().set(&votes_key, &0u32);
             env.events().publish(
                 (symbol_short!("audit"), symbol_short!("blt_crtd")),
                 (ballot_id_hash.clone(), now, caller.clone()),
@@ -507,8 +505,8 @@ impl AnonVoteContract {
             return Err(ContractError::InvalidBallotHash);
         }
 
-        let key = DataKey::BallotMetadata(ballot_id_hash.clone());
-        if env.storage().persistent().has(&key) {
+        let metadata_key = DataKey::BallotMetadata(ballot_id_hash.clone());
+        if env.storage().persistent().has(&metadata_key) {
             return Err(ContractError::BallotAlreadyExists);
         }
 
@@ -521,13 +519,13 @@ impl AnonVoteContract {
             state: BallotState::Active,
             state_updated_at: now,
         };
-        env.storage().persistent().set(&key, &metadata);
-        env.storage()
-            .persistent()
-            .set(&DataKey::TokensIssued(ballot_id_hash.clone()), &0u32);
-        env.storage()
-            .persistent()
-            .set(&DataKey::VotesCast(ballot_id_hash.clone()), &0u32);
+        env.storage().persistent().set(&metadata_key, &metadata);
+
+        // Reuse the cloned hash for the remaining storage keys
+        let tokens_key = DataKey::TokensIssued(ballot_id_hash.clone());
+        let votes_key = DataKey::VotesCast(ballot_id_hash.clone());
+        env.storage().persistent().set(&tokens_key, &0u32);
+        env.storage().persistent().set(&votes_key, &0u32);
         env.events().publish(
             (symbol_short!("audit"), symbol_short!("blt_crtd")),
             (ballot_id_hash, now, caller),
@@ -543,8 +541,7 @@ impl AnonVoteContract {
         caller.require_auth();
         Self::require_not_paused(&env)?;
         Self::require_admin(&env, &caller)?;
-        let metadata = Self::require_ballot_metadata(&env, &ballot_id_hash)?;
-        Self::require_ballot_not_expired(&env, &ballot_id_hash)?;
+        let metadata = Self::require_ballot_metadata_and_not_expired(&env, &ballot_id_hash)?;
 
         let key = DataKey::TokensIssued(ballot_id_hash.clone());
         let count: u32 = env.storage().persistent().get(&key).unwrap_or(0);
@@ -568,8 +565,7 @@ impl AnonVoteContract {
         caller.require_auth();
         Self::require_not_paused(&env)?;
         Self::require_admin(&env, &caller)?;
-        let metadata = Self::require_ballot_metadata(&env, &ballot_id_hash)?;
-        Self::require_ballot_not_expired(&env, &ballot_id_hash)?;
+        let metadata = Self::require_ballot_metadata_and_not_expired(&env, &ballot_id_hash)?;
 
         let key = DataKey::VotesCast(ballot_id_hash.clone());
         let count: u32 = env.storage().persistent().get(&key).unwrap_or(0);
@@ -834,7 +830,7 @@ impl AnonVoteContract {
         }
         let stored_result_hash: String = env.storage().persistent().get(&result_key).unwrap();
 
-        let mut current_hash = vote_merkle_proof.vote_hash.clone();
+        let mut current_hash = vote_merkle_proof.vote_hash;
         let mut idx = vote_merkle_proof.index;
 
         for sibling in vote_merkle_proof.path.iter() {
@@ -1089,17 +1085,39 @@ impl AnonVoteContract {
         env: &Env,
         ballot_id_hash: &String,
     ) -> Result<BallotMetadata, ContractError> {
+        let key = DataKey::BallotMetadata(ballot_id_hash.clone());
         env.storage()
             .persistent()
-            .get(&DataKey::BallotMetadata(ballot_id_hash.clone()))
+            .get(&key)
             .ok_or(ContractError::BallotNotFound)
     }
 
-    fn require_ballot_not_expired(env: &Env, ballot_id_hash: &String) -> Result<(), ContractError> {
+    /// Returns ballot metadata and checks expiration in a single call.
+    /// Saves one persistent storage read compared to calling
+    /// `require_ballot_metadata` + `require_ballot_not_expired` separately.
+    fn require_ballot_metadata_and_not_expired(
+        env: &Env,
+        ballot_id_hash: &String,
+    ) -> Result<BallotMetadata, ContractError> {
+        let metadata = Self::require_ballot_metadata(env, ballot_id_hash)?;
+        let expired_key = DataKey::BallotExpired(ballot_id_hash.clone());
         let explicitly_expired: bool = env
             .storage()
             .persistent()
-            .get(&DataKey::BallotExpired(ballot_id_hash.clone()))
+            .get(&expired_key)
+            .unwrap_or(false);
+        if explicitly_expired {
+            return Err(ContractError::BallotExpired);
+        }
+        Ok(metadata)
+    }
+
+    fn require_ballot_not_expired(env: &Env, ballot_id_hash: &String) -> Result<(), ContractError> {
+        let key = DataKey::BallotExpired(ballot_id_hash.clone());
+        let explicitly_expired: bool = env
+            .storage()
+            .persistent()
+            .get(&key)
             .unwrap_or(false);
         if explicitly_expired {
             return Err(ContractError::BallotExpired);
