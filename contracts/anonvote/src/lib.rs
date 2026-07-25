@@ -1,4 +1,4 @@
-//! AnonVote Soroban smart contract.
+﻿//! AnonVote Soroban smart contract.
 //!
 //! The contract stores public ballot audit data and protects critical
 //! governance operations with configurable M-of-N approval.
@@ -117,6 +117,23 @@ pub struct RotationRecord {
     pub old_admin: Address,
     pub new_admin: Address,
     pub rotated_at: u64,
+}
+
+/// Typed, structured audit events for external indexers.
+///
+/// These are published in addition to the existing lightweight
+/// `symbol_short!()` topic events (e.g. `("audit","blt_crtd")`), which
+/// remain unchanged for backward compatibility with anything already
+/// consuming them. `BallotEvent` gives external systems a single,
+/// strongly-typed payload to decode without needing to hardcode short
+/// topic symbols.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BallotEvent {
+    BallotCreated(String, u64),
+    TokenRecorded(String, u32),
+    VoteRecorded(String, u32),
+    ResultPublished(String, String),
 }
 
 /// Operations that must be approved by the configured M-of-N approvers.
@@ -458,7 +475,7 @@ impl AnonVoteContract {
         Self::require_not_paused(&env)?;
         Self::require_admin(&env, &caller)?;
 
-        // ── Phase 1: validate everything before writing anything ──────────
+        // â”€â”€ Phase 1: validate everything before writing anything â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         for i in 0..ballots.len() {
             let (ballot_id_hash, _) = ballots.get(i).unwrap();
             if !is_valid_sha256_hex(&ballot_id_hash) {
@@ -470,7 +487,7 @@ impl AnonVoteContract {
             }
         }
 
-        // ── Phase 2: write all ballots ────────────────────────────────────
+        // â”€â”€ Phase 2: write all ballots â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         let now = env.ledger().timestamp();
         let mut recorded: Vec<String> = Vec::new(&env);
 
@@ -536,7 +553,11 @@ impl AnonVoteContract {
         env.storage().persistent().set(&votes_key, &0u32);
         env.events().publish(
             (symbol_short!("audit"), symbol_short!("blt_crtd")),
-            (ballot_id_hash, now, caller),
+            (ballot_id_hash.clone(), now, caller),
+        );
+        env.events().publish(
+            (symbol_short!("ballot"),),
+            BallotEvent::BallotCreated(ballot_id_hash, now),
         );
         Ok(())
     }
@@ -560,7 +581,11 @@ impl AnonVoteContract {
         env.storage().persistent().set(&key, &new_count);
         env.events().publish(
             (symbol_short!("audit"), symbol_short!("tok_issd")),
-            (ballot_id_hash, new_count),
+            (ballot_id_hash.clone(), new_count),
+        );
+        env.events().publish(
+            (symbol_short!("ballot"),),
+            BallotEvent::TokenRecorded(ballot_id_hash, new_count),
         );
         Ok(())
     }
@@ -584,7 +609,11 @@ impl AnonVoteContract {
         env.storage().persistent().set(&key, &new_count);
         env.events().publish(
             (symbol_short!("audit"), symbol_short!("vote_cast")),
-            (ballot_id_hash, new_count),
+            (ballot_id_hash.clone(), new_count),
+        );
+        env.events().publish(
+            (symbol_short!("ballot"),),
+            BallotEvent::VoteRecorded(ballot_id_hash, new_count),
         );
         Ok(())
     }
@@ -748,7 +777,7 @@ impl AnonVoteContract {
 
     /// Returns the ledger timestamp captured when the ballot was first recorded.
     /// Returns None if the ballot does not exist.
-    /// The value is immutable — it is set once in record_ballot and never updated.
+    /// The value is immutable â€” it is set once in record_ballot and never updated.
     pub fn get_ballot_created_at(env: Env, ballot_id_hash: String) -> Option<u64> {
         let metadata: BallotMetadata = env
             .storage()
@@ -958,6 +987,10 @@ impl AnonVoteContract {
                 env.events().publish(
                     (symbol_short!("audit"), symbol_short!("res_pub")),
                     (ballot_id_hash.clone(), result_hash.clone()),
+                );
+                env.events().publish(
+                    (symbol_short!("ballot"),),
+                    BallotEvent::ResultPublished(ballot_id_hash.clone(), result_hash.clone()),
                 );
             }
             CriticalOperation::Pause => {
@@ -1174,7 +1207,8 @@ fn bytes_to_hex(env: &Env, bytes: &BytesN<32>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::testutils::{Address as _, Ledger};
+    use soroban_sdk::testutils::{Address as _, Events, Ledger};
+    use soroban_sdk::{IntoVal, TryIntoVal};
 
     // Valid 64-char lowercase hex strings used as ballot / result hashes in tests.
     // Each is a real SHA-256 hex digest so they pass is_valid_sha256_hex().
@@ -1709,7 +1743,7 @@ mod tests {
         assert_eq!(ts_b - ts_a, 60);
     }
 
-    // ── record_ballots_batch tests ────────────────────────────────────────
+    // â”€â”€ record_ballots_batch tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn batch_records_all_ballots_and_returns_hashes() {
@@ -1817,7 +1851,7 @@ mod tests {
         let id = String::from_str(&env, BALLOT_A);
         let ballots = Vec::from_array(&env, [(id, limits(10, 10))]);
 
-        // Should be rejected — only admin can record ballots
+        // Should be rejected â€” only admin can record ballots
         assert_eq!(
             client.try_record_ballots_batch(&non_admin, &ballots),
             Err(Ok(ContractError::AdminUnauthorized))
