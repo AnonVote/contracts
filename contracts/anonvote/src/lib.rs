@@ -1,4 +1,4 @@
-//! AnonVote Soroban smart contract.
+﻿//! AnonVote Soroban smart contract.
 //!
 //! The contract stores public ballot audit data and protects critical
 //! governance operations with configurable M-of-N approval.
@@ -115,6 +115,23 @@ pub struct RotationRecord {
     pub old_admin: Address,
     pub new_admin: Address,
     pub rotated_at: u64,
+}
+
+/// Typed, structured audit events for external indexers.
+///
+/// These are published in addition to the existing lightweight
+/// `symbol_short!()` topic events (e.g. `("audit","blt_crtd")`), which
+/// remain unchanged for backward compatibility with anything already
+/// consuming them. `BallotEvent` gives external systems a single,
+/// strongly-typed payload to decode without needing to hardcode short
+/// topic symbols.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BallotEvent {
+    BallotCreated(String, u64),
+    TokenRecorded(String, u32),
+    VoteRecorded(String, u32),
+    ResultPublished(String, String),
 }
 
 /// Operations that must be approved by the configured M-of-N approvers.
@@ -450,7 +467,7 @@ impl AnonVoteContract {
         Self::require_not_paused(&env)?;
         Self::require_admin(&env, &caller)?;
 
-        // ── Phase 1: validate everything before writing anything ──────────
+        // â”€â”€ Phase 1: validate everything before writing anything â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         for i in 0..ballots.len() {
             let (ballot_id_hash, _) = ballots.get(i).unwrap();
             if ballot_id_hash.is_empty() {
@@ -462,7 +479,7 @@ impl AnonVoteContract {
             }
         }
 
-        // ── Phase 2: write all ballots ────────────────────────────────────
+        // â”€â”€ Phase 2: write all ballots â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         let now = env.ledger().timestamp();
         let mut recorded: Vec<String> = Vec::new(&env);
 
@@ -530,7 +547,11 @@ impl AnonVoteContract {
             .set(&DataKey::VotesCast(ballot_id_hash.clone()), &0u32);
         env.events().publish(
             (symbol_short!("audit"), symbol_short!("blt_crtd")),
-            (ballot_id_hash, now, caller),
+            (ballot_id_hash.clone(), now, caller),
+        );
+        env.events().publish(
+            (symbol_short!("ballot"),),
+            BallotEvent::BallotCreated(ballot_id_hash, now),
         );
         Ok(())
     }
@@ -555,7 +576,11 @@ impl AnonVoteContract {
         env.storage().persistent().set(&key, &new_count);
         env.events().publish(
             (symbol_short!("audit"), symbol_short!("tok_issd")),
-            (ballot_id_hash, new_count),
+            (ballot_id_hash.clone(), new_count),
+        );
+        env.events().publish(
+            (symbol_short!("ballot"),),
+            BallotEvent::TokenRecorded(ballot_id_hash, new_count),
         );
         Ok(())
     }
@@ -580,7 +605,11 @@ impl AnonVoteContract {
         env.storage().persistent().set(&key, &new_count);
         env.events().publish(
             (symbol_short!("audit"), symbol_short!("vote_cast")),
-            (ballot_id_hash, new_count),
+            (ballot_id_hash.clone(), new_count),
+        );
+        env.events().publish(
+            (symbol_short!("ballot"),),
+            BallotEvent::VoteRecorded(ballot_id_hash, new_count),
         );
         Ok(())
     }
@@ -744,7 +773,7 @@ impl AnonVoteContract {
 
     /// Returns the ledger timestamp captured when the ballot was first recorded.
     /// Returns None if the ballot does not exist.
-    /// The value is immutable — it is set once in record_ballot and never updated.
+    /// The value is immutable â€” it is set once in record_ballot and never updated.
     pub fn get_ballot_created_at(env: Env, ballot_id_hash: String) -> Option<u64> {
         let metadata: BallotMetadata = env
             .storage()
@@ -955,6 +984,10 @@ impl AnonVoteContract {
                     (symbol_short!("audit"), symbol_short!("res_pub")),
                     (ballot_id_hash.clone(), result_hash.clone()),
                 );
+                env.events().publish(
+                    (symbol_short!("ballot"),),
+                    BallotEvent::ResultPublished(ballot_id_hash.clone(), result_hash.clone()),
+                );
             }
             CriticalOperation::Pause => {
                 env.storage().instance().set(&DataKey::IsPaused, &true);
@@ -1124,7 +1157,8 @@ fn bytes_to_hex(env: &Env, bytes: &BytesN<32>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::testutils::{Address as _, Ledger};
+    use soroban_sdk::testutils::{Address as _, Events, Ledger};
+    use soroban_sdk::{IntoVal, TryIntoVal};
 
     fn setup() -> (Env, AnonVoteContractClient<'static>, Address) {
         let env = Env::default();
@@ -1647,7 +1681,7 @@ mod tests {
         assert_eq!(ts_b - ts_a, 60);
     }
 
-    // ── record_ballots_batch tests ────────────────────────────────────────
+    // â”€â”€ record_ballots_batch tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn batch_records_all_ballots_and_returns_hashes() {
@@ -1755,7 +1789,7 @@ mod tests {
         let id = String::from_str(&env, "unauth-batch");
         let ballots = Vec::from_array(&env, [(id, limits(10, 10))]);
 
-        // Should be rejected — only admin can record ballots
+        // Should be rejected â€” only admin can record ballots
         assert_eq!(
             client.try_record_ballots_batch(&non_admin, &ballots),
             Err(Ok(ContractError::AdminUnauthorized))
@@ -1778,5 +1812,135 @@ mod tests {
         assert_eq!(meta.limits.max_votes, 7);
         assert_eq!(meta.admin, admin);
         assert_eq!(meta.state, BallotState::Active);
+    }
+
+    // â”€â”€ BallotEvent typed event tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    /// Decodes the most recently published typed `BallotEvent`, i.e. the
+    /// last event whose topic is the single-symbol `("ballot",)` tuple used
+    /// by `BallotEvent` publishes (as opposed to the existing multi-part
+    /// `("audit", "...")` / `("govern", "...")` topics, which remain
+    /// unchanged and are not `BallotEvent`s).
+    fn last_ballot_event(env: &Env) -> BallotEvent {
+        let all = env.events().all();
+        let ballot_topic: Vec<soroban_sdk::Val> =
+            (symbol_short!("ballot"),).into_val(env);
+        let (_, _, data) = all
+            .iter()
+            .filter(|(_, topics, _)| *topics == ballot_topic)
+            .last()
+            .expect("expected at least one BallotEvent to have been published")
+            .clone();
+        data.try_into_val(env)
+            .expect("event data should decode as BallotEvent")
+    }
+
+    fn count_ballot_events(env: &Env) -> u32 {
+        let all = env.events().all();
+        let ballot_topic: Vec<soroban_sdk::Val> =
+            (symbol_short!("ballot"),).into_val(env);
+        all.iter()
+            .filter(|(_, topics, _)| *topics == ballot_topic)
+            .count() as u32
+    }
+
+    #[test]
+    fn record_ballot_emits_typed_ballot_created_event() {
+        let (env, client, admin) = setup();
+        let ballot = String::from_str(&env, "typed-event-ballot");
+        let created_at = env.ledger().timestamp();
+
+        client.record_ballot(&admin, &ballot, &limits(10, 10));
+
+        assert_eq!(
+            last_ballot_event(&env),
+            BallotEvent::BallotCreated(ballot, created_at)
+        );
+    }
+
+    #[test]
+    fn record_token_emits_typed_token_recorded_event() {
+        let (env, client, admin) = setup();
+        let ballot = String::from_str(&env, "typed-event-token");
+        client.record_ballot(&admin, &ballot, &limits(10, 10));
+
+        client.record_token(&admin, &ballot);
+        assert_eq!(
+            last_ballot_event(&env),
+            BallotEvent::TokenRecorded(ballot.clone(), 1)
+        );
+
+        client.record_token(&admin, &ballot);
+        assert_eq!(
+            last_ballot_event(&env),
+            BallotEvent::TokenRecorded(ballot, 2)
+        );
+    }
+
+    #[test]
+    fn record_vote_emits_typed_vote_recorded_event() {
+        let (env, client, admin) = setup();
+        let ballot = String::from_str(&env, "typed-event-vote");
+        client.record_ballot(&admin, &ballot, &limits(10, 10));
+
+        client.record_vote(&admin, &ballot);
+        assert_eq!(
+            last_ballot_event(&env),
+            BallotEvent::VoteRecorded(ballot, 1)
+        );
+    }
+
+    #[test]
+    fn record_result_emits_typed_result_published_event_after_approval() {
+        let (env, client, admin) = setup();
+        let ballot = String::from_str(&env, "typed-event-result");
+        let result = String::from_str(&env, "typed-event-result-hash");
+        client.record_ballot(&admin, &ballot, &limits(10, 10));
+
+        let operation_id = client.record_result(&admin, &ballot, &result);
+        // Default governance is 1-of-1 with the admin as sole approver, so
+        // this single approval crosses the threshold and executes inline.
+        assert!(client.approve_operation(&operation_id, &admin));
+
+        assert_eq!(
+            last_ballot_event(&env),
+            BallotEvent::ResultPublished(ballot, result)
+        );
+    }
+
+    #[test]
+    fn typed_ballot_events_are_additive_and_do_not_replace_existing_audit_events() {
+        let (env, client, admin) = setup();
+        let ballot = String::from_str(&env, "typed-event-additive");
+
+        client.record_ballot(&admin, &ballot, &limits(10, 10));
+
+        // The pre-existing ("audit","blt_crtd") event must still be present
+        // alongside the new typed event â€” this is an additive change, not
+        // a replacement, so nothing already consuming the old event breaks.
+        let legacy_topic: Vec<soroban_sdk::Val> =
+            (symbol_short!("audit"), symbol_short!("blt_crtd")).into_val(&env);
+        let all = env.events().all();
+        let legacy_event_present = all.iter().any(|(_, topics, _)| topics == legacy_topic);
+        assert!(legacy_event_present, "legacy audit event should still be emitted");
+        assert_eq!(count_ballot_events(&env), 1);
+    }
+
+    #[test]
+    fn failed_record_token_does_not_emit_a_typed_event() {
+        let (env, client, admin) = setup();
+        let ballot = String::from_str(&env, "typed-event-limit");
+        client.record_ballot(&admin, &ballot, &limits(1, 1));
+
+        client.record_token(&admin, &ballot);
+        assert_eq!(count_ballot_events(&env), 2);
+
+        // Second call exceeds max_tokens=1 and must fail without emitting
+        // another BallotEvent.
+        assert_eq!(
+            client.try_record_token(&admin, &ballot),
+            Err(Ok(ContractError::LimitExceeded))
+        );
+        assert_eq!(count_ballot_events(&env), 2);
     }
 }
