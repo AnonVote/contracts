@@ -31,7 +31,12 @@ const OTHER_ADMIN_SECRET_KEY = "S" + "C".repeat(55);
 const CONTRACT_ID = "C" + "D".repeat(55);
 
 function makeConfig(secretKey = ADMIN_SECRET_KEY): SorobanConfig {
-  return { stellarSecretKey: secretKey, stellarNetwork: "testnet", contractId: CONTRACT_ID };
+  return {
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    networkPassphrase: "Test SDF Network ; September 2015",
+    contractId: CONTRACT_ID,
+    sourceKeypair: StellarSdk.Keypair.fromSecret(secretKey),
+  };
 }
 
 let ledger: FakeLedger;
@@ -153,7 +158,7 @@ describe("AnonVote ballot lifecycle (mocked contract, no live network)", () => {
   });
 
   it("every helper returns NotConfigured rather than throwing when config validation fails", async () => {
-    const badConfig = makeConfig("not-a-real-secret-key");
+    const badConfig = { ...makeConfig(), sourceKeypair: undefined as any };
     const ballotIdHash = "ballot-hash-005";
 
     const results = await Promise.all([
@@ -212,7 +217,7 @@ describe("AnonVote ballot lifecycle (mocked contract, no live network)", () => {
     expect(report1).not.toBeNull();
     
     // Verify all required fields
-    const expectedAdmin = StellarSdk.Keypair.fromSecret(config.stellarSecretKey).publicKey();
+    const expectedAdmin = config.sourceKeypair.publicKey();
     expect(report1!.admin).toBe(expectedAdmin);
     expect(report1!.created_at).toBe(1718880000); // Fixed in FakeLedger
     expect(report1!.expiration_time).toBe(0);
@@ -362,7 +367,7 @@ describe("Admin key rotation (mocked contract, no live network)", () => {
   });
 
   it("returns NotConfigured without touching RPC when config is invalid", async () => {
-    const badConfig = makeConfig("not-a-real-secret-key");
+    const badConfig = { ...makeConfig(), sourceKeypair: undefined as any };
     const result = await sorobanRotateAdmin(badConfig, "GSOME_ADDRESS");
     expect(result.success).toBe(false);
     expect(result.errorCode).toBe(SorobanErrorCode.NotConfigured);

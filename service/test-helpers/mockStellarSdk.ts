@@ -23,6 +23,7 @@ export const mockRpc = {
   simulateTransaction: vi.fn(),
   sendTransaction: vi.fn(),
   getTransaction: vi.fn(),
+  getEvents: vi.fn(async () => ({ events: [], latestLedger: 0 })),
 };
 
 export function resetMockRpc() {
@@ -33,6 +34,7 @@ export function resetMockRpc() {
   mockRpc.simulateTransaction.mockReset();
   mockRpc.sendTransaction.mockReset();
   mockRpc.getTransaction.mockReset();
+  mockRpc.getEvents.mockReset();
 }
 
 /** Fake ScVal wrapper — carries a native value plus a tag so our fake
@@ -72,6 +74,7 @@ class FakeServer {
   simulateTransaction = mockRpc.simulateTransaction;
   sendTransaction = mockRpc.sendTransaction;
   getTransaction = mockRpc.getTransaction;
+  getEvents = mockRpc.getEvents;
   constructor(_url: string, _opts?: unknown) {}
 }
 
