@@ -20,6 +20,8 @@ import {
   sorobanRotateAdmin,
   sorobanGetRotationHistory,
   SorobanErrorCode,
+  SorobanServiceError,
+  SorobanServiceErrorCode,
   type SorobanConfig,
 } from "./sorobanService";
 import * as StellarSdk from "stellar-sdk";
@@ -110,17 +112,25 @@ describe("AnonVote ballot lifecycle (mocked contract, no live network)", () => {
 
     await sorobanRecordBallot(config, ballotIdHash);
     await sorobanRecordResult(config, ballotIdHash, "result-hash-ccc");
-    const conflicting = await sorobanRecordResult(config, ballotIdHash, "result-hash-DIFFERENT");
 
-    expect(conflicting.success).toBe(false);
-    expect(conflicting.errorCode).toBe(SorobanErrorCode.ResultAlreadyPublished);
+    await expect(
+      sorobanRecordResult(config, ballotIdHash, "result-hash-DIFFERENT"),
+    ).rejects.toSatisfy(
+      (err: unknown) =>
+        err instanceof SorobanServiceError &&
+        err.code === SorobanServiceErrorCode.CONTRACT_ERROR &&
+        err.contractErrorCode === SorobanErrorCode.ResultAlreadyPublished,
+    );
   });
 
   it("returns BallotNotFound when recording a token against a ballot that was never created", async () => {
     const config = makeConfig();
-    const result = await sorobanRecordToken(config, "never-created");
-    expect(result.success).toBe(false);
-    expect(result.errorCode).toBe(SorobanErrorCode.BallotNotFound);
+    await expect(sorobanRecordToken(config, "never-created")).rejects.toSatisfy(
+      (err: unknown) =>
+        err instanceof SorobanServiceError &&
+        err.code === SorobanServiceErrorCode.CONTRACT_ERROR &&
+        err.contractErrorCode === SorobanErrorCode.BallotNotFound,
+    );
   });
 
   it("treats re-recording the same ballot by the same admin as idempotent, but a different admin as a conflict", async () => {
@@ -134,9 +144,12 @@ describe("AnonVote ballot lifecycle (mocked contract, no live network)", () => {
     const sameAdminAgain = await sorobanRecordBallot(adminConfig, ballotIdHash);
     expect(sameAdminAgain.success).toBe(true);
 
-    const differentAdmin = await sorobanRecordBallot(otherAdminConfig, ballotIdHash);
-    expect(differentAdmin.success).toBe(false);
-    expect(differentAdmin.errorCode).toBe(SorobanErrorCode.BallotAlreadyExists);
+    await expect(sorobanRecordBallot(otherAdminConfig, ballotIdHash)).rejects.toSatisfy(
+      (err: unknown) =>
+        err instanceof SorobanServiceError &&
+        err.code === SorobanServiceErrorCode.CONTRACT_ERROR &&
+        err.contractErrorCode === SorobanErrorCode.BallotAlreadyExists,
+    );
   });
 
   it("every helper returns NotConfigured rather than throwing when config validation fails", async () => {
@@ -159,14 +172,13 @@ describe("AnonVote ballot lifecycle (mocked contract, no live network)", () => {
 
   it("TypeScript enforces error-field access only on the failure branch (compile-time check)", async () => {
     const config = makeConfig();
-    const result = await sorobanRecordToken(config, "never-created-either");
 
-    if (!result.success) {
-      // Only reachable (and only type-checks) when success is narrowed to false.
-      expect(result.errorCode).toBe(SorobanErrorCode.BallotNotFound);
-    } else {
-      expect(result.txHash).toBeTypeOf("string");
-    }
+    // sorobanRecordToken now throws on failure — verify the throw carries the
+    // correct contractErrorCode so callers can distinguish failure kinds.
+    const err = await sorobanRecordToken(config, "never-created-either").catch((e) => e);
+    expect(err).toBeInstanceOf(SorobanServiceError);
+    expect((err as SorobanServiceError).contractErrorCode).toBe(SorobanErrorCode.BallotNotFound);
+    expect((err as SorobanServiceError).retryable).toBe(false);
   });
 
   it("sorobanResultExists returns false before publication and true after", async () => {

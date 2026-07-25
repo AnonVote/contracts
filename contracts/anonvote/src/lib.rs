@@ -39,6 +39,8 @@ pub enum ContractError {
     OperationNotPending = 20,
     OperationExpired = 21,
     SameAdmin = 22,
+    InvalidBallotIdHash = 23,
+    InvalidResultHash = 24,
 }
 
 #[contracttype]
@@ -322,6 +324,12 @@ impl AnonVoteContract {
         ballot_id_hash: String,
         result_hash: String,
     ) -> Result<u64, ContractError> {
+        if !is_valid_sha256_hex(&ballot_id_hash) {
+            return Err(ContractError::InvalidBallotIdHash);
+        }
+        if !is_valid_sha256_hex(&result_hash) {
+            return Err(ContractError::InvalidResultHash);
+        }
         Self::create_operation(
             env,
             caller,
@@ -470,8 +478,8 @@ impl AnonVoteContract {
         // â”€â”€ Phase 1: validate everything before writing anything â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         for i in 0..ballots.len() {
             let (ballot_id_hash, _) = ballots.get(i).unwrap();
-            if ballot_id_hash.is_empty() {
-                return Err(ContractError::InvalidBallotHash);
+            if !is_valid_sha256_hex(&ballot_id_hash) {
+                return Err(ContractError::InvalidBallotIdHash);
             }
             let key = DataKey::BallotMetadata(ballot_id_hash.clone());
             if env.storage().persistent().has(&key) {
@@ -520,8 +528,8 @@ impl AnonVoteContract {
         caller.require_auth();
         Self::require_not_paused(&env)?;
         Self::require_admin(&env, &caller)?;
-        if ballot_id_hash.is_empty() {
-            return Err(ContractError::InvalidBallotHash);
+        if !is_valid_sha256_hex(&ballot_id_hash) {
+            return Err(ContractError::InvalidBallotIdHash);
         }
 
         let key = DataKey::BallotMetadata(ballot_id_hash.clone());
@@ -564,6 +572,9 @@ impl AnonVoteContract {
         caller.require_auth();
         Self::require_not_paused(&env)?;
         Self::require_admin(&env, &caller)?;
+        if !is_valid_sha256_hex(&ballot_id_hash) {
+            return Err(ContractError::InvalidBallotIdHash);
+        }
         let metadata = Self::require_ballot_metadata(&env, &ballot_id_hash)?;
         Self::require_ballot_not_expired(&env, &ballot_id_hash)?;
 
@@ -593,6 +604,9 @@ impl AnonVoteContract {
         caller.require_auth();
         Self::require_not_paused(&env)?;
         Self::require_admin(&env, &caller)?;
+        if !is_valid_sha256_hex(&ballot_id_hash) {
+            return Err(ContractError::InvalidBallotIdHash);
+        }
         let metadata = Self::require_ballot_metadata(&env, &ballot_id_hash)?;
         Self::require_ballot_not_expired(&env, &ballot_id_hash)?;
 
@@ -1141,6 +1155,30 @@ impl AnonVoteContract {
     }
 }
 
+/// Returns `true` iff `s` is exactly 64 lowercase hexadecimal characters
+/// (`[0-9a-f]`), as produced by a SHA-256 hash function.
+///
+/// Uppercase hex is explicitly rejected: `hashIdentifier` in
+/// `@anonvote/crypto` always outputs lowercase, and storing uppercase
+/// would silently break independent verification.
+fn is_valid_sha256_hex(s: &String) -> bool {
+    if s.len() != 64 {
+        return false;
+    }
+    let mut buf = [0u8; 64];
+    s.copy_into_slice(&mut buf);
+    let mut i = 0usize;
+    while i < 64 {
+        let b = buf[i];
+        let valid = (b >= b'0' && b <= b'9') || (b >= b'a' && b <= b'f');
+        if !valid {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 fn bytes_to_hex(env: &Env, bytes: &BytesN<32>) -> String {
     let arr = bytes.to_array();
     let mut buf = [0u8; 64];
@@ -1159,6 +1197,18 @@ mod tests {
     use super::*;
     use soroban_sdk::testutils::{Address as _, Events, Ledger};
     use soroban_sdk::{IntoVal, TryIntoVal};
+
+    // Valid 64-char lowercase hex strings used as ballot / result hashes in tests.
+    // Each is a real SHA-256 hex digest so they pass is_valid_sha256_hex().
+    const BALLOT_A: &str = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+    const BALLOT_B: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const BALLOT_C: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+    const BALLOT_D: &str = "3333333333333333333333333333333333333333333333333333333333333333";
+    const BALLOT_E: &str = "4444444444444444444444444444444444444444444444444444444444444444";
+    const BALLOT_F: &str = "5555555555555555555555555555555555555555555555555555555555555555";
+    const BALLOT_G: &str = "6666666666666666666666666666666666666666666666666666666666666666";
+    const RESULT_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const RESULT_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     fn setup() -> (Env, AnonVoteContractClient<'static>, Address) {
         let env = Env::default();
@@ -1202,7 +1252,7 @@ mod tests {
     #[test]
     fn contract_is_valid_after_initialization() {
         let (env, client, admin) = setup();
-        let ballot = String::from_str(&env, "initialized");
+        let ballot = String::from_str(&env, BALLOT_A);
         client.record_ballot(&admin, &ballot, &limits(10, 10));
         assert_eq!(client.get_admin(), Some(admin));
         assert_eq!(client.get_tokens_issued(&ballot), Some(0));
@@ -1211,7 +1261,7 @@ mod tests {
     #[test]
     fn write_operations_reject_uninitialized_contract() {
         let (env, client, admin, _) = setup_uninitialized();
-        let ballot = String::from_str(&env, "uninitialized");
+        let ballot = String::from_str(&env, BALLOT_A);
         let approver = Address::generate(&env);
 
         assert_eq!(
@@ -1244,7 +1294,7 @@ mod tests {
             env.storage().instance().set(&DataKey::Admin, &admin);
         });
 
-        let ballot = String::from_str(&env, "partial");
+        let ballot = String::from_str(&env, BALLOT_A);
         assert_eq!(
             client.try_record_ballot(&admin, &ballot, &limits(1, 1)),
             Err(Ok(ContractError::NotInitialized))
@@ -1255,8 +1305,8 @@ mod tests {
     fn insufficient_approvals_block_result_publication() {
         let (env, client, admin) = setup();
         let (first, second, _) = configure_two_of_three(&env, &client, &admin);
-        let ballot = String::from_str(&env, "ballot");
-        let result = String::from_str(&env, "result");
+        let ballot = String::from_str(&env, BALLOT_A);
+        let result = String::from_str(&env, RESULT_A);
         client.record_ballot(&admin, &ballot, &limits(10, 10));
 
         let operation_id = client.record_result(&admin, &ballot, &result);
@@ -1455,7 +1505,7 @@ mod tests {
     #[test]
     fn ballot_limits_and_counts_still_work() {
         let (env, client, admin) = setup();
-        let ballot = String::from_str(&env, "limited");
+        let ballot = String::from_str(&env, BALLOT_A);
         client.record_ballot(&admin, &ballot, &limits(1, 1));
         client.record_token(&admin, &ballot);
         client.record_vote(&admin, &ballot);
@@ -1471,7 +1521,7 @@ mod tests {
     #[test]
     fn ballot_audit_report_works() {
         let (env, client, admin) = setup();
-        let ballot = String::from_str(&env, "audit-ballot");
+        let ballot = String::from_str(&env, BALLOT_A);
         
         // Report for non-existent ballot should be None
         assert_eq!(client.get_audit_report(&ballot), None);
@@ -1509,7 +1559,7 @@ mod tests {
         assert!(!report3.is_consistent);
 
         // Publish result
-        let result = String::from_str(&env, "election-result");
+        let result = String::from_str(&env, RESULT_A);
         let operation_id = client.record_result(&admin, &ballot, &result);
         client.approve_operation(&operation_id, &admin);
 
@@ -1521,7 +1571,7 @@ mod tests {
     #[test]
     fn verify_result_proof_works() {
         let (env, client, admin) = setup();
-        let ballot = String::from_str(&env, "merkle-ballot");
+        let ballot = String::from_str(&env, BALLOT_A);
         client.record_ballot(&admin, &ballot, &limits(10, 10));
 
         let leaf0_bytes = [1u8; 32];
@@ -1561,7 +1611,7 @@ mod tests {
 
         // Verify valid proof for a single-node tree (empty path, leaf is root)
         let single_root_hex = bytes_to_hex(&env, &leaf0);
-        let ballot_single = String::from_str(&env, "single-node-ballot");
+        let ballot_single = String::from_str(&env, BALLOT_B);
         client.record_ballot(&admin, &ballot_single, &limits(10, 10));
         let op_id_single = client.record_result(&admin, &ballot_single, &single_root_hex);
         client.approve_operation(&op_id_single, &admin);
@@ -1602,7 +1652,7 @@ mod tests {
         assert!(!client.verify_result_proof(&ballot, &proof0, &wrong_root_hex));
 
         // Verify non-existent ballot
-        let non_existent_ballot = String::from_str(&env, "non-existent-ballot");
+        let non_existent_ballot = String::from_str(&env, BALLOT_C);
         let res = client.try_verify_result_proof(&non_existent_ballot, &proof0, &root_hex);
         assert_eq!(res, Err(Ok(ContractError::BallotNotFound)));
     }
@@ -1610,7 +1660,7 @@ mod tests {
     #[test]
     fn get_ballot_created_at_returns_timestamp_set_at_creation() {
         let (env, client, admin) = setup();
-        let ballot = String::from_str(&env, "ts-ballot");
+        let ballot = String::from_str(&env, BALLOT_A);
 
         // Before creation: returns None
         assert_eq!(client.get_ballot_created_at(&ballot), None);
@@ -1626,7 +1676,7 @@ mod tests {
     #[test]
     fn get_ballot_created_at_is_immutable_after_state_changes() {
         let (env, client, admin) = setup();
-        let ballot = String::from_str(&env, "immutable-ts-ballot");
+        let ballot = String::from_str(&env, BALLOT_A);
 
         client.record_ballot(&admin, &ballot, &limits(10, 10));
         let creation_time = client.get_ballot_created_at(&ballot).unwrap();
@@ -1641,7 +1691,7 @@ mod tests {
 
         // Advance again and publish result; timestamp still unchanged
         env.ledger().with_mut(|l| l.timestamp += 100);
-        let result = String::from_str(&env, "result-hash");
+        let result = String::from_str(&env, RESULT_A);
         let op_id = client.record_result(&admin, &ballot, &result);
         client.approve_operation(&op_id, &admin);
 
@@ -1651,7 +1701,7 @@ mod tests {
     #[test]
     fn get_ballot_created_at_matches_metadata_and_audit_report() {
         let (env, client, admin) = setup();
-        let ballot = String::from_str(&env, "cross-check-ballot");
+        let ballot = String::from_str(&env, BALLOT_A);
 
         client.record_ballot(&admin, &ballot, &limits(10, 10));
 
@@ -1666,8 +1716,8 @@ mod tests {
     #[test]
     fn ballots_created_at_different_ledger_times_have_distinct_timestamps() {
         let (env, client, admin) = setup();
-        let ballot_a = String::from_str(&env, "ballot-a");
-        let ballot_b = String::from_str(&env, "ballot-b");
+        let ballot_a = String::from_str(&env, BALLOT_A);
+        let ballot_b = String::from_str(&env, BALLOT_B);
 
         client.record_ballot(&admin, &ballot_a, &limits(10, 10));
         let ts_a = client.get_ballot_created_at(&ballot_a).unwrap();
@@ -1686,9 +1736,9 @@ mod tests {
     #[test]
     fn batch_records_all_ballots_and_returns_hashes() {
         let (env, client, admin) = setup();
-        let id_a = String::from_str(&env, "batch-a");
-        let id_b = String::from_str(&env, "batch-b");
-        let id_c = String::from_str(&env, "batch-c");
+        let id_a = String::from_str(&env, BALLOT_A);
+        let id_b = String::from_str(&env, BALLOT_B);
+        let id_c = String::from_str(&env, BALLOT_C);
 
         let ballots = Vec::from_array(
             &env,
@@ -1718,7 +1768,7 @@ mod tests {
     #[test]
     fn batch_fails_atomically_when_any_ballot_hash_is_empty() {
         let (env, client, admin) = setup();
-        let id_a = String::from_str(&env, "atomic-a");
+        let id_a = String::from_str(&env, BALLOT_A);
         let empty = String::from_str(&env, "");
 
         let ballots = Vec::from_array(
@@ -1731,7 +1781,7 @@ mod tests {
 
         assert_eq!(
             client.try_record_ballots_batch(&admin, &ballots),
-            Err(Ok(ContractError::InvalidBallotHash))
+            Err(Ok(ContractError::InvalidBallotIdHash))
         );
 
         // First ballot must NOT have been written (atomic rollback)
@@ -1741,8 +1791,8 @@ mod tests {
     #[test]
     fn batch_fails_atomically_when_any_ballot_already_exists() {
         let (env, client, admin) = setup();
-        let existing = String::from_str(&env, "already-exists");
-        let new_one = String::from_str(&env, "brand-new");
+        let existing = String::from_str(&env, BALLOT_A);
+        let new_one = String::from_str(&env, BALLOT_B);
 
         // Pre-record the first ballot
         client.record_ballot(&admin, &existing, &limits(5, 5));
@@ -1773,7 +1823,7 @@ mod tests {
         client.approve_operation(&op_id, &admin);
         assert!(client.is_paused());
 
-        let id = String::from_str(&env, "paused-ballot");
+        let id = String::from_str(&env, BALLOT_A);
         let ballots = Vec::from_array(&env, [(id, limits(10, 10))]);
 
         assert_eq!(
@@ -1786,7 +1836,7 @@ mod tests {
     fn batch_is_rejected_by_non_admin() {
         let (env, client, admin) = setup();
         let non_admin = Address::generate(&env);
-        let id = String::from_str(&env, "unauth-batch");
+        let id = String::from_str(&env, BALLOT_A);
         let ballots = Vec::from_array(&env, [(id, limits(10, 10))]);
 
         // Should be rejected â€” only admin can record ballots
@@ -1799,7 +1849,7 @@ mod tests {
     #[test]
     fn single_item_batch_matches_record_ballot_behavior() {
         let (env, client, admin) = setup();
-        let id = String::from_str(&env, "single-batch");
+        let id = String::from_str(&env, BALLOT_A);
 
         let ballots = Vec::from_array(&env, [(id.clone(), limits(5, 7))]);
         let recorded = client.record_ballots_batch(&admin, &ballots);
@@ -1847,7 +1897,7 @@ mod tests {
     #[test]
     fn record_ballot_emits_typed_ballot_created_event() {
         let (env, client, admin) = setup();
-        let ballot = String::from_str(&env, "typed-event-ballot");
+        let ballot = String::from_str(&env, "0101010101010101010101010101010101010101010101010101010101010101");
         let created_at = env.ledger().timestamp();
 
         client.record_ballot(&admin, &ballot, &limits(10, 10));
@@ -1861,7 +1911,7 @@ mod tests {
     #[test]
     fn record_token_emits_typed_token_recorded_event() {
         let (env, client, admin) = setup();
-        let ballot = String::from_str(&env, "typed-event-token");
+        let ballot = String::from_str(&env, "0202020202020202020202020202020202020202020202020202020202020202");
         client.record_ballot(&admin, &ballot, &limits(10, 10));
 
         client.record_token(&admin, &ballot);
@@ -1880,7 +1930,7 @@ mod tests {
     #[test]
     fn record_vote_emits_typed_vote_recorded_event() {
         let (env, client, admin) = setup();
-        let ballot = String::from_str(&env, "typed-event-vote");
+        let ballot = String::from_str(&env, "0303030303030303030303030303030303030303030303030303030303030303");
         client.record_ballot(&admin, &ballot, &limits(10, 10));
 
         client.record_vote(&admin, &ballot);
@@ -1893,8 +1943,8 @@ mod tests {
     #[test]
     fn record_result_emits_typed_result_published_event_after_approval() {
         let (env, client, admin) = setup();
-        let ballot = String::from_str(&env, "typed-event-result");
-        let result = String::from_str(&env, "typed-event-result-hash");
+        let ballot = String::from_str(&env, "0404040404040404040404040404040404040404040404040404040404040404");
+        let result = String::from_str(&env, "0505050505050505050505050505050505050505050505050505050505050505");
         client.record_ballot(&admin, &ballot, &limits(10, 10));
 
         let operation_id = client.record_result(&admin, &ballot, &result);
@@ -1911,7 +1961,7 @@ mod tests {
     #[test]
     fn typed_ballot_events_are_additive_and_do_not_replace_existing_audit_events() {
         let (env, client, admin) = setup();
-        let ballot = String::from_str(&env, "typed-event-additive");
+        let ballot = String::from_str(&env, "0606060606060606060606060606060606060606060606060606060606060606");
 
         client.record_ballot(&admin, &ballot, &limits(10, 10));
 
@@ -1929,7 +1979,7 @@ mod tests {
     #[test]
     fn failed_record_token_does_not_emit_a_typed_event() {
         let (env, client, admin) = setup();
-        let ballot = String::from_str(&env, "typed-event-limit");
+        let ballot = String::from_str(&env, "0707070707070707070707070707070707070707070707070707070707070707");
         client.record_ballot(&admin, &ballot, &limits(1, 1));
 
         client.record_token(&admin, &ballot);
@@ -1942,5 +1992,260 @@ mod tests {
             Err(Ok(ContractError::LimitExceeded))
         );
         assert_eq!(count_ballot_events(&env), 2);
+    }
+
+    // ── SHA-256 hex validation tests ──────────────────────────────────────
+
+    /// is_valid_sha256_hex accepts a well-formed 64-char lowercase hex string.
+    #[test]
+    fn sha256_hex_valid_64_char_lowercase_hex_passes() {
+        let env = Env::default();
+        let hash = String::from_str(&env, BALLOT_A);
+        assert!(is_valid_sha256_hex(&hash));
+    }
+
+    /// is_valid_sha256_hex rejects a 63-character string.
+    #[test]
+    fn sha256_hex_63_chars_is_rejected() {
+        let env = Env::default();
+        // 63 lowercase hex chars
+        let short = String::from_str(&env, "abcdef1234567890abcdef1234567890abcdef1234567890abcdef123456789");
+        assert!(!is_valid_sha256_hex(&short));
+    }
+
+    /// is_valid_sha256_hex rejects a 65-character string.
+    #[test]
+    fn sha256_hex_65_chars_is_rejected() {
+        let env = Env::default();
+        // 65 lowercase hex chars
+        let long = String::from_str(&env, "abcdef1234567890abcdef1234567890abcdef1234567890abcdef12345678901");
+        assert!(!is_valid_sha256_hex(&long));
+    }
+
+    /// is_valid_sha256_hex rejects uppercase hex characters.
+    #[test]
+    fn sha256_hex_uppercase_is_rejected() {
+        let env = Env::default();
+        // Valid length but uppercase A-F
+        let upper = String::from_str(&env, "ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890");
+        assert!(!is_valid_sha256_hex(&upper));
+    }
+
+    /// is_valid_sha256_hex rejects strings containing non-hex characters.
+    #[test]
+    fn sha256_hex_non_hex_chars_are_rejected() {
+        let env = Env::default();
+        // Valid length but contains 'g' and '-'
+        let non_hex = String::from_str(&env, "abcdef1234567890abcdef1234567890abcdef1234567890abcdef123456789g");
+        assert!(!is_valid_sha256_hex(&non_hex));
+    }
+
+    /// is_valid_sha256_hex rejects an empty string.
+    #[test]
+    fn sha256_hex_empty_string_is_rejected() {
+        let env = Env::default();
+        let empty = String::from_str(&env, "");
+        assert!(!is_valid_sha256_hex(&empty));
+    }
+
+    /// record_ballot returns InvalidBallotIdHash for a non-hex ballot_id_hash.
+    #[test]
+    fn record_ballot_rejects_invalid_ballot_id_hash() {
+        let (env, client, admin) = setup();
+        let bad = String::from_str(&env, "not-a-sha256-hash");
+        assert_eq!(
+            client.try_record_ballot(&admin, &bad, &limits(10, 10)),
+            Err(Ok(ContractError::InvalidBallotIdHash))
+        );
+    }
+
+    /// record_ballot returns InvalidBallotIdHash for a 63-char string.
+    #[test]
+    fn record_ballot_rejects_63_char_ballot_id_hash() {
+        let (env, client, admin) = setup();
+        let short = String::from_str(&env, "abcdef1234567890abcdef1234567890abcdef1234567890abcdef123456789");
+        assert_eq!(
+            client.try_record_ballot(&admin, &short, &limits(10, 10)),
+            Err(Ok(ContractError::InvalidBallotIdHash))
+        );
+    }
+
+    /// record_ballot returns InvalidBallotIdHash for a 65-char string.
+    #[test]
+    fn record_ballot_rejects_65_char_ballot_id_hash() {
+        let (env, client, admin) = setup();
+        let long = String::from_str(&env, "abcdef1234567890abcdef1234567890abcdef1234567890abcdef12345678901");
+        assert_eq!(
+            client.try_record_ballot(&admin, &long, &limits(10, 10)),
+            Err(Ok(ContractError::InvalidBallotIdHash))
+        );
+    }
+
+    /// record_ballot returns InvalidBallotIdHash for uppercase hex.
+    #[test]
+    fn record_ballot_rejects_uppercase_ballot_id_hash() {
+        let (env, client, admin) = setup();
+        let upper = String::from_str(&env, "ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890");
+        assert_eq!(
+            client.try_record_ballot(&admin, &upper, &limits(10, 10)),
+            Err(Ok(ContractError::InvalidBallotIdHash))
+        );
+    }
+
+    /// record_ballot returns InvalidBallotIdHash for an empty string.
+    #[test]
+    fn record_ballot_rejects_empty_ballot_id_hash() {
+        let (env, client, admin) = setup();
+        let empty = String::from_str(&env, "");
+        assert_eq!(
+            client.try_record_ballot(&admin, &empty, &limits(10, 10)),
+            Err(Ok(ContractError::InvalidBallotIdHash))
+        );
+    }
+
+    /// record_token returns InvalidBallotIdHash for a non-hex ballot_id_hash.
+    #[test]
+    fn record_token_rejects_invalid_ballot_id_hash() {
+        let (env, client, admin) = setup();
+        let bad = String::from_str(&env, "not-a-sha256-hash");
+        assert_eq!(
+            client.try_record_token(&admin, &bad),
+            Err(Ok(ContractError::InvalidBallotIdHash))
+        );
+    }
+
+    /// record_vote returns InvalidBallotIdHash for a non-hex ballot_id_hash.
+    #[test]
+    fn record_vote_rejects_invalid_ballot_id_hash() {
+        let (env, client, admin) = setup();
+        let bad = String::from_str(&env, "not-a-sha256-hash");
+        assert_eq!(
+            client.try_record_vote(&admin, &bad),
+            Err(Ok(ContractError::InvalidBallotIdHash))
+        );
+    }
+
+    /// record_result returns InvalidBallotIdHash for a non-hex ballot_id_hash.
+    #[test]
+    fn record_result_rejects_invalid_ballot_id_hash() {
+        let (env, client, admin) = setup();
+        let bad_ballot = String::from_str(&env, "not-a-sha256-hash");
+        let good_result = String::from_str(&env, RESULT_A);
+        assert_eq!(
+            client.try_record_result(&admin, &bad_ballot, &good_result),
+            Err(Ok(ContractError::InvalidBallotIdHash))
+        );
+    }
+
+    /// record_result returns InvalidResultHash for a non-hex result_hash.
+    #[test]
+    fn record_result_rejects_invalid_result_hash() {
+        let (env, client, admin) = setup();
+        let good_ballot = String::from_str(&env, BALLOT_A);
+        let bad_result = String::from_str(&env, "not-a-sha256-hash");
+        assert_eq!(
+            client.try_record_result(&admin, &good_ballot, &bad_result),
+            Err(Ok(ContractError::InvalidResultHash))
+        );
+    }
+
+    /// record_result returns InvalidResultHash for a 63-char result_hash.
+    #[test]
+    fn record_result_rejects_63_char_result_hash() {
+        let (env, client, admin) = setup();
+        let ballot = String::from_str(&env, BALLOT_A);
+        let short = String::from_str(&env, "abcdef1234567890abcdef1234567890abcdef1234567890abcdef123456789");
+        assert_eq!(
+            client.try_record_result(&admin, &ballot, &short),
+            Err(Ok(ContractError::InvalidResultHash))
+        );
+    }
+
+    /// record_result returns InvalidResultHash for a 65-char result_hash.
+    #[test]
+    fn record_result_rejects_65_char_result_hash() {
+        let (env, client, admin) = setup();
+        let ballot = String::from_str(&env, BALLOT_A);
+        let long = String::from_str(&env, "abcdef1234567890abcdef1234567890abcdef1234567890abcdef12345678901");
+        assert_eq!(
+            client.try_record_result(&admin, &ballot, &long),
+            Err(Ok(ContractError::InvalidResultHash))
+        );
+    }
+
+    /// record_result returns InvalidResultHash for uppercase hex result_hash.
+    #[test]
+    fn record_result_rejects_uppercase_result_hash() {
+        let (env, client, admin) = setup();
+        let ballot = String::from_str(&env, BALLOT_A);
+        let upper = String::from_str(&env, "ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890");
+        assert_eq!(
+            client.try_record_result(&admin, &ballot, &upper),
+            Err(Ok(ContractError::InvalidResultHash))
+        );
+    }
+
+    /// record_result returns InvalidResultHash for an empty result_hash.
+    #[test]
+    fn record_result_rejects_empty_result_hash() {
+        let (env, client, admin) = setup();
+        let ballot = String::from_str(&env, BALLOT_A);
+        let empty = String::from_str(&env, "");
+        assert_eq!(
+            client.try_record_result(&admin, &ballot, &empty),
+            Err(Ok(ContractError::InvalidResultHash))
+        );
+    }
+
+    /// record_result does not write to storage when result_hash is invalid.
+    #[test]
+    fn record_result_does_not_write_on_invalid_result_hash() {
+        let (env, client, admin) = setup();
+        let ballot = String::from_str(&env, BALLOT_A);
+        client.record_ballot(&admin, &ballot, &limits(10, 10));
+
+        let bad_result = String::from_str(&env, "not-a-sha256-hash");
+        let _ = client.try_record_result(&admin, &ballot, &bad_result);
+
+        // Nothing must have been written
+        assert_eq!(client.get_result_hash(&ballot), None);
+    }
+
+    /// record_ballots_batch returns InvalidBallotIdHash when any entry has a bad hash.
+    #[test]
+    fn batch_rejects_invalid_ballot_id_hash_atomically() {
+        let (env, client, admin) = setup();
+        let good = String::from_str(&env, BALLOT_A);
+        let bad = String::from_str(&env, "not-a-sha256-hash");
+
+        let ballots = Vec::from_array(
+            &env,
+            [
+                (good.clone(), limits(10, 10)),
+                (bad, limits(10, 10)),
+            ],
+        );
+
+        assert_eq!(
+            client.try_record_ballots_batch(&admin, &ballots),
+            Err(Ok(ContractError::InvalidBallotIdHash))
+        );
+
+        // The valid ballot must NOT have been written (atomic rollback)
+        assert!(!client.ballot_exists(&good));
+    }
+
+    /// A valid record_result call with both hashes correct succeeds end-to-end.
+    #[test]
+    fn record_result_accepts_valid_sha256_hashes() {
+        let (env, client, admin) = setup();
+        let ballot = String::from_str(&env, BALLOT_A);
+        let result = String::from_str(&env, RESULT_A);
+        client.record_ballot(&admin, &ballot, &limits(10, 10));
+
+        let op_id = client.record_result(&admin, &ballot, &result);
+        client.approve_operation(&op_id, &admin);
+
+        assert_eq!(client.get_result_hash(&ballot), Some(result));
     }
 }
