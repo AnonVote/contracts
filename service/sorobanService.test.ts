@@ -29,6 +29,8 @@ import {
   sorobanRotateAdmin,
   sorobanGetRotationHistory,
   SorobanErrorCode,
+  SorobanServiceError,
+  SorobanServiceErrorCode,
   DEFAULT_RETRY_POLICY,
   createSorobanService,
   createDefaultTestnetConfig,
@@ -226,18 +228,28 @@ describe("sorobanRecordResult — finality guard / idempotency", () => {
       // readContract for get_result_hash returns a DIFFERENT hash
       .mockResolvedValueOnce(simulationSuccess("result-hash-DIFFERENT"));
 
-    const result = await sorobanRecordResult(makeConfig(), "ballot-y", "result-hash-mine");
-    expect(result.success).toBe(false);
-    expect(result.errorCode).toBe(SorobanErrorCode.ResultAlreadyPublished);
+    await expect(
+      sorobanRecordResult(makeConfig(), "ballot-y", "result-hash-mine"),
+    ).rejects.toSatisfy(
+      (err: unknown) =>
+        err instanceof SorobanServiceError &&
+        err.code === SorobanServiceErrorCode.CONTRACT_ERROR &&
+        err.contractErrorCode === SorobanErrorCode.ResultAlreadyPublished,
+    );
     expect(mockRpc.sendTransaction).not.toHaveBeenCalled();
   });
 
   it("propagates non-finality errors (e.g. BallotNotFound) unchanged", async () => {
     mockRpc.simulateTransaction.mockResolvedValueOnce(simulationError("Error(Contract, #4)"));
 
-    const result = await sorobanRecordResult(makeConfig(), "missing-ballot", "hash");
-    expect(result.success).toBe(false);
-    expect(result.errorCode).toBe(SorobanErrorCode.BallotNotFound);
+    await expect(
+      sorobanRecordResult(makeConfig(), "missing-ballot", "hash"),
+    ).rejects.toSatisfy(
+      (err: unknown) =>
+        err instanceof SorobanServiceError &&
+        err.code === SorobanServiceErrorCode.CONTRACT_ERROR &&
+        err.contractErrorCode === SorobanErrorCode.BallotNotFound,
+    );
   });
 });
 
@@ -304,108 +316,6 @@ describe("sorobanVerifyResultProof", () => {
     mockRpc.simulateTransaction.mockResolvedValueOnce(simulationError("Error(Contract, #4)"));
     const result = await sorobanVerifyResultProof(makeConfig(), "ballot-1", dummyProof, "result-hash");
     expect(result).toBeNull();
-  });
-});
-
-describe("verifyBallotConsistency", () => {
-  it("returns a consistent report when on-chain tokens_issued == votes_cast and it matches the database count", async () => {
-    mockRpc.simulateTransaction
-      .mockResolvedValueOnce(simulationSuccess(5)) // get_tokens_issued
-      .mockResolvedValueOnce(simulationSuccess(5)) // get_votes_cast
-      .mockResolvedValueOnce(simulationSuccess(true)); // is_consistent
-
-    const report = await verifyBallotConsistency(makeConfig(), "ballot-ok", 5);
-
-    expect(report).toMatchObject({
-      ballotIdHash: "ballot-ok",
-      consistent: true,
-      tokensIssuedOnChain: 5,
-      votesCastOnChain: 5,
-      votesCastInDatabase: 5,
-      databaseMatchesChain: true,
-    });
-    expect(report.error).toBeUndefined();
-    expect(typeof report.checkedAt).toBe("number");
-  });
-
-  it("returns consistent: false when the contract reports tokens_issued != votes_cast", async () => {
-    mockRpc.simulateTransaction
-      .mockResolvedValueOnce(simulationSuccess(10)) // get_tokens_issued
-      .mockResolvedValueOnce(simulationSuccess(7)) // get_votes_cast
-      .mockResolvedValueOnce(simulationSuccess(false)); // is_consistent
-
-    const report = await verifyBallotConsistency(makeConfig(), "ballot-bad", 7);
-
-    expect(report.consistent).toBe(false);
-    expect(report.tokensIssuedOnChain).toBe(10);
-    expect(report.votesCastOnChain).toBe(7);
-    // Database count matches on-chain votes_cast even though the ballot itself is inconsistent —
-    // the two checks are independent.
-    expect(report.databaseMatchesChain).toBe(true);
-  });
-
-  it("flags databaseMatchesChain: false when the database vote count disagrees with the chain", async () => {
-    mockRpc.simulateTransaction
-      .mockResolvedValueOnce(simulationSuccess(5))
-      .mockResolvedValueOnce(simulationSuccess(5))
-      .mockResolvedValueOnce(simulationSuccess(true));
-
-    const report = await verifyBallotConsistency(makeConfig(), "ballot-drift", 4);
-
-    expect(report.consistent).toBe(true);
-    expect(report.votesCastOnChain).toBe(5);
-    expect(report.votesCastInDatabase).toBe(4);
-    expect(report.databaseMatchesChain).toBe(false);
-  });
-
-  it("leaves databaseMatchesChain null when no database vote count is supplied", async () => {
-    mockRpc.simulateTransaction
-      .mockResolvedValueOnce(simulationSuccess(3))
-      .mockResolvedValueOnce(simulationSuccess(3))
-      .mockResolvedValueOnce(simulationSuccess(true));
-
-    const report = await verifyBallotConsistency(makeConfig(), "ballot-no-db-count");
-
-    expect(report.consistent).toBe(true);
-    expect(report.votesCastInDatabase).toBeNull();
-    expect(report.databaseMatchesChain).toBeNull();
-  });
-
-  it("returns an error report (not a throw) when the contract ID is invalid", async () => {
-    const report = await verifyBallotConsistency(
-      makeConfig({ contractId: "not-a-contract" }),
-      "ballot-x",
-      3,
-    );
-
-    expect(report.consistent).toBe(false);
-    expect(report.tokensIssuedOnChain).toBeNull();
-    expect(report.votesCastOnChain).toBeNull();
-    expect(report.error).toBeTruthy();
-    expect(mockRpc.simulateTransaction).not.toHaveBeenCalled();
-  });
-
-  it("returns an error report (not a throw) when the contract call fails", async () => {
-    mockRpc.simulateTransaction.mockResolvedValueOnce(simulationError("Error(Contract, #4)"));
-
-    const report = await verifyBallotConsistency(makeConfig(), "ballot-unreachable", 2);
-
-    expect(report.consistent).toBe(false);
-    expect(report.tokensIssuedOnChain).toBeNull();
-    expect(report.votesCastOnChain).toBeNull();
-    expect(report.error).toBeTruthy();
-  });
-
-  it("logs a warning (not an error/throw) when the ballot is inconsistent", async () => {
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-    mockRpc.simulateTransaction
-      .mockResolvedValueOnce(simulationSuccess(10))
-      .mockResolvedValueOnce(simulationSuccess(7))
-      .mockResolvedValueOnce(simulationSuccess(false));
-
-    const report = await verifyBallotConsistency(makeConfig(), "ballot-logged", 7);
-    expect(report.consistent).toBe(false);
-    expect(warnSpy).toHaveBeenCalled();
   });
 });
 
@@ -505,9 +415,14 @@ describe("sorobanRecordBallotsBatch — unit tests (mocked RPC)", () => {
   it("returns BallotAlreadyExists when any ballot in the batch already exists", async () => {
     mockRpc.simulateTransaction.mockResolvedValueOnce(simulationError("Error(Contract, #5)"));
 
-    const result = await sorobanRecordBallotsBatch(makeConfig(), ballots);
-    expect(result.success).toBe(false);
-    expect(result.errorCode).toBe(SorobanErrorCode.BallotAlreadyExists);
+    await expect(
+      sorobanRecordBallotsBatch(makeConfig(), ballots),
+    ).rejects.toSatisfy(
+      (err: unknown) =>
+        err instanceof SorobanServiceError &&
+        err.code === SorobanServiceErrorCode.CONTRACT_ERROR &&
+        err.contractErrorCode === SorobanErrorCode.BallotAlreadyExists,
+    );
     // Batch rejected at simulation — no transaction sent
     expect(mockRpc.sendTransaction).not.toHaveBeenCalled();
   });
@@ -515,30 +430,45 @@ describe("sorobanRecordBallotsBatch — unit tests (mocked RPC)", () => {
   it("returns InvalidBallotHash when any ballot has an empty hash", async () => {
     mockRpc.simulateTransaction.mockResolvedValueOnce(simulationError("Error(Contract, #8)"));
 
-    const result = await sorobanRecordBallotsBatch(makeConfig(), [
-      { ballotIdHash: "good-hash" },
-      { ballotIdHash: "" },
-    ]);
-    expect(result.success).toBe(false);
-    expect(result.errorCode).toBe(SorobanErrorCode.InvalidBallotHash);
+    await expect(
+      sorobanRecordBallotsBatch(makeConfig(), [
+        { ballotIdHash: "good-hash" },
+        { ballotIdHash: "" },
+      ]),
+    ).rejects.toSatisfy(
+      (err: unknown) =>
+        err instanceof SorobanServiceError &&
+        err.code === SorobanServiceErrorCode.CONTRACT_ERROR &&
+        err.contractErrorCode === SorobanErrorCode.InvalidBallotHash,
+    );
     expect(mockRpc.sendTransaction).not.toHaveBeenCalled();
   });
 
   it("returns ContractPaused when the contract is paused", async () => {
     mockRpc.simulateTransaction.mockResolvedValueOnce(simulationError("Error(Contract, #13)"));
 
-    const result = await sorobanRecordBallotsBatch(makeConfig(), ballots);
-    expect(result.success).toBe(false);
-    expect(result.errorCode).toBe(SorobanErrorCode.ContractPaused);
+    await expect(
+      sorobanRecordBallotsBatch(makeConfig(), ballots),
+    ).rejects.toSatisfy(
+      (err: unknown) =>
+        err instanceof SorobanServiceError &&
+        err.code === SorobanServiceErrorCode.CONTRACT_ERROR &&
+        err.contractErrorCode === SorobanErrorCode.ContractPaused,
+    );
     expect(mockRpc.sendTransaction).not.toHaveBeenCalled();
   });
 
   it("returns AdminUnauthorized when caller is not the admin", async () => {
     mockRpc.simulateTransaction.mockResolvedValueOnce(simulationError("Error(Contract, #1)"));
 
-    const result = await sorobanRecordBallotsBatch(makeConfig(), ballots);
-    expect(result.success).toBe(false);
-    expect(result.errorCode).toBe(SorobanErrorCode.AdminUnauthorized);
+    await expect(
+      sorobanRecordBallotsBatch(makeConfig(), ballots),
+    ).rejects.toSatisfy(
+      (err: unknown) =>
+        err instanceof SorobanServiceError &&
+        err.code === SorobanServiceErrorCode.CONTRACT_ERROR &&
+        err.contractErrorCode === SorobanErrorCode.AdminUnauthorized,
+    );
     expect(mockRpc.sendTransaction).not.toHaveBeenCalled();
   });
 
@@ -565,9 +495,14 @@ describe("sorobanRecordBallotsBatch — unit tests (mocked RPC)", () => {
   it("returns NetworkError without throwing when the RPC call rejects", async () => {
     mockRpc.simulateTransaction.mockRejectedValueOnce(new Error("connection refused"));
 
-    const result = await sorobanRecordBallotsBatch(makeConfig(), ballots);
-    expect(result.success).toBe(false);
-    expect(result.errorCode).toBe(SorobanErrorCode.NetworkError);
+    await expect(
+      sorobanRecordBallotsBatch(makeConfig(), ballots),
+    ).rejects.toSatisfy(
+      (err: unknown) =>
+        err instanceof SorobanServiceError &&
+        err.code === SorobanServiceErrorCode.NETWORK_ERROR &&
+        err.retryable === true,
+    );
   });
 });
 
@@ -720,5 +655,106 @@ describe("createSorobanService", () => {
 
     expect(configA.contractId).not.toBe(configB.contractId);
     expect(configA.sourceKeypair.publicKey()).not.toBe(configB.sourceKeypair.publicKey());
+  });
+});
+
+describe("verifyBallotConsistency", () => {
+  it("returns a consistent report when on-chain tokens_issued == votes_cast and it matches the database count", async () => {
+    mockRpc.simulateTransaction
+      .mockResolvedValueOnce(simulationSuccess(5)) // get_tokens_issued
+      .mockResolvedValueOnce(simulationSuccess(5)) // get_votes_cast
+      .mockResolvedValueOnce(simulationSuccess(true)); // is_consistent
+
+    const report = await verifyBallotConsistency(makeConfig(), "ballot-ok", 5);
+
+    expect(report).toMatchObject({
+      ballotIdHash: "ballot-ok",
+      consistent: true,
+      tokensIssuedOnChain: 5,
+      votesCastOnChain: 5,
+      votesCastInDatabase: 5,
+      databaseMatchesChain: true,
+    });
+    expect(report.error).toBeUndefined();
+    expect(typeof report.checkedAt).toBe("number");
+  });
+
+  it("returns consistent: false when the contract reports tokens_issued != votes_cast", async () => {
+    mockRpc.simulateTransaction
+      .mockResolvedValueOnce(simulationSuccess(10)) // get_tokens_issued
+      .mockResolvedValueOnce(simulationSuccess(7)) // get_votes_cast
+      .mockResolvedValueOnce(simulationSuccess(false)); // is_consistent
+
+    const report = await verifyBallotConsistency(makeConfig(), "ballot-bad", 7);
+
+    expect(report.consistent).toBe(false);
+    expect(report.tokensIssuedOnChain).toBe(10);
+    expect(report.votesCastOnChain).toBe(7);
+    expect(report.databaseMatchesChain).toBe(true);
+  });
+
+  it("flags databaseMatchesChain: false when the database vote count disagrees with the chain", async () => {
+    mockRpc.simulateTransaction
+      .mockResolvedValueOnce(simulationSuccess(5))
+      .mockResolvedValueOnce(simulationSuccess(5))
+      .mockResolvedValueOnce(simulationSuccess(true));
+
+    const report = await verifyBallotConsistency(makeConfig(), "ballot-drift", 4);
+
+    expect(report.consistent).toBe(true);
+    expect(report.votesCastOnChain).toBe(5);
+    expect(report.votesCastInDatabase).toBe(4);
+    expect(report.databaseMatchesChain).toBe(false);
+  });
+
+  it("leaves databaseMatchesChain null when no database vote count is supplied", async () => {
+    mockRpc.simulateTransaction
+      .mockResolvedValueOnce(simulationSuccess(3))
+      .mockResolvedValueOnce(simulationSuccess(3))
+      .mockResolvedValueOnce(simulationSuccess(true));
+
+    const report = await verifyBallotConsistency(makeConfig(), "ballot-no-db-count");
+
+    expect(report.consistent).toBe(true);
+    expect(report.votesCastInDatabase).toBeNull();
+    expect(report.databaseMatchesChain).toBeNull();
+  });
+
+  it("returns an error report (not a throw) when the contract ID is invalid", async () => {
+    const report = await verifyBallotConsistency(
+      makeConfig({ contractId: "not-a-contract" }),
+      "ballot-x",
+      3,
+    );
+
+    expect(report.consistent).toBe(false);
+    expect(report.tokensIssuedOnChain).toBeNull();
+    expect(report.votesCastOnChain).toBeNull();
+    expect(report.error).toBeTruthy();
+    expect(mockRpc.simulateTransaction).not.toHaveBeenCalled();
+  });
+
+  it("returns an error report (not a throw) when the contract call fails", async () => {
+    mockRpc.simulateTransaction.mockResolvedValueOnce(simulationError("Error(Contract, #4)"));
+
+    const report = await verifyBallotConsistency(makeConfig(), "ballot-unreachable", 2);
+
+    expect(report.consistent).toBe(false);
+    expect(report.tokensIssuedOnChain).toBeNull();
+    expect(report.votesCastOnChain).toBeNull();
+    expect(report.error).toBeTruthy();
+  });
+
+  it("logs a warning (not an error/throw) when the ballot is inconsistent", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    mockRpc.simulateTransaction
+      .mockResolvedValueOnce(simulationSuccess(10))
+      .mockResolvedValueOnce(simulationSuccess(7))
+      .mockResolvedValueOnce(simulationSuccess(false));
+
+    const report = await verifyBallotConsistency(makeConfig(), "ballot-logged", 7);
+
+    expect(report.consistent).toBe(false);
+    expect(warnSpy).toHaveBeenCalled();
   });
 });
