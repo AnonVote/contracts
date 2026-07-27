@@ -28,6 +28,7 @@ type FakeBallot = {
   votesCast: number;
   resultHash: string | null;
   state: "Active" | "ResultPublished" | "Archived";
+  isActive: boolean;
 };
 
 type RotationRecord = {
@@ -54,6 +55,7 @@ const FAKE_LEDGER_TIMESTAMP = 1718880000;
 
 export class FakeLedger {
   private ballots = new Map<string, FakeBallot>();
+  private ballotList: string[] = [];
   private admin: string = "";
   private rotationHistory: RotationRecord[] = [];
   private timestamp: number = FAKE_LEDGER_TIMESTAMP;
@@ -89,7 +91,10 @@ export class FakeLedger {
           votesCast: 0,
           resultHash: null,
           state: "Active",
+          isActive: true,
         });
+        // Track in ballot list
+        this.ballotList.push(ballotIdHash);
         return { ok: true };
       }
 
@@ -116,6 +121,7 @@ export class FakeLedger {
         }
         ballot.resultHash = resultHash;
         ballot.state = "ResultPublished";
+        ballot.isActive = false;
         return { ok: true };
       }
 
@@ -207,6 +213,50 @@ export class FakeLedger {
         };
       }
 
+      case "get_ballot_metadata": {
+        const ballotMeta = this.ballots.get(get(0) as string);
+        if (!ballotMeta) {
+          return { ok: true, value: { created_at: 0, admin: "", is_active: false } };
+        }
+        return {
+          ok: true,
+          value: {
+            created_at: ballotMeta.createdAt,
+            admin: ballotMeta.admin,
+            is_active: ballotMeta.isActive,
+          },
+        };
+      }
+
+      case "get_ballot_stats": {
+        const ballotStats = this.ballots.get(get(0) as string);
+        if (!ballotStats) {
+          return { ok: true, value: { tokens_issued: 0, votes_cast: 0, result_hash: null } };
+        }
+        return {
+          ok: true,
+          value: {
+            tokens_issued: ballotStats.tokensIssued,
+            votes_cast: ballotStats.votesCast,
+            result_hash: ballotStats.resultHash,
+          },
+        };
+      }
+
+      case "get_all_ballots": {
+        return { ok: true, value: [...this.ballotList] };
+      }
+
+      case "ballot_is_active": {
+        const activeBallot = this.ballots.get(get(0) as string);
+        return { ok: true, value: activeBallot?.isActive ?? false };
+      }
+
+      case "is_ballot_finalized": {
+        const finalizedBallot = this.ballots.get(get(0) as string);
+        return { ok: true, value: finalizedBallot?.resultHash !== null && finalizedBallot?.resultHash !== undefined };
+      }
+
       case "verify_result_proof": {
         const ballotIdHash = get(0) as string;
         const ballot = this.ballots.get(ballotIdHash);
@@ -251,6 +301,7 @@ export class FakeLedger {
 
   reset() {
     this.ballots.clear();
+    this.ballotList = [];
     this.admin = "";
     this.rotationHistory = [];
     this.timestamp = FAKE_LEDGER_TIMESTAMP;

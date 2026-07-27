@@ -27,6 +27,11 @@ import {
   sorobanVerifyResultProof,
   sorobanRotateAdmin,
   sorobanGetRotationHistory,
+  sorobanGetBallotMetadata,
+  sorobanGetBallotStats,
+  sorobanGetAllBallots,
+  sorobanBallotIsActive,
+  sorobanIsBallotFinalized,
   SorobanErrorCode,
   SorobanServiceError,
   SorobanServiceErrorCode,
@@ -278,6 +283,114 @@ describe("sorobanResultExists — finality pre-check query", () => {
     mockRpc.simulateTransaction.mockResolvedValueOnce(simulationError("Error(Contract, #3)"));
     const result = await sorobanResultExists(makeConfig(), "ballot-d");
     expect(result).toBeNull();
+  });
+});
+
+describe("sorobanGetBallotMetadata — view function", () => {
+  it("returns ballot metadata for an existing ballot", async () => {
+    const raw = { created_at: 1718880000, admin: "GADMIN", is_active: true };
+    mockRpc.simulateTransaction.mockResolvedValueOnce(simulationSuccess(raw));
+
+    const meta = await sorobanGetBallotMetadata(makeConfig(), "ballot-1");
+    expect(meta).toEqual({ created_at: 1718880000, admin: "GADMIN", is_active: true });
+  });
+
+  it("returns null when ballot does not exist", async () => {
+    mockRpc.simulateTransaction.mockResolvedValueOnce(simulationError("Error(Contract, #4)"));
+    const meta = await sorobanGetBallotMetadata(makeConfig(), "missing");
+    expect(meta).toBeNull();
+  });
+
+  it("returns null when contract ID is invalid without calling RPC", async () => {
+    const meta = await sorobanGetBallotMetadata(makeConfig({ contractId: "bad-id" }), "ballot-1");
+    expect(meta).toBeNull();
+    expect(mockRpc.simulateTransaction).not.toHaveBeenCalled();
+  });
+});
+
+describe("sorobanGetBallotStats — view function", () => {
+  it("returns ballot stats for an existing ballot", async () => {
+    const raw = { tokens_issued: 5, votes_cast: 3, result_hash: null };
+    mockRpc.simulateTransaction.mockResolvedValueOnce(simulationSuccess(raw));
+
+    const stats = await sorobanGetBallotStats(makeConfig(), "ballot-1");
+    expect(stats).toEqual({ tokens_issued: 5, votes_cast: 3, result_hash: null });
+  });
+
+  it("returns stats with result_hash when published", async () => {
+    const raw = { tokens_issued: 5, votes_cast: 5, result_hash: "tally-hash" };
+    mockRpc.simulateTransaction.mockResolvedValueOnce(simulationSuccess(raw));
+
+    const stats = await sorobanGetBallotStats(makeConfig(), "ballot-1");
+    expect(stats).toEqual({ tokens_issued: 5, votes_cast: 5, result_hash: "tally-hash" });
+  });
+
+  it("returns null for invalid contract ID", async () => {
+    const stats = await sorobanGetBallotStats(makeConfig({ contractId: "bad-id" }), "ballot-1");
+    expect(stats).toBeNull();
+    expect(mockRpc.simulateTransaction).not.toHaveBeenCalled();
+  });
+});
+
+describe("sorobanGetAllBallots — view function", () => {
+  it("returns list of ballot hashes", async () => {
+    const raw = ["ballot-a", "ballot-b", "ballot-c"];
+    mockRpc.simulateTransaction.mockResolvedValueOnce(simulationSuccess(raw));
+
+    const all = await sorobanGetAllBallots(makeConfig());
+    expect(all).toEqual(["ballot-a", "ballot-b", "ballot-c"]);
+  });
+
+  it("returns empty array when no ballots exist", async () => {
+    mockRpc.simulateTransaction.mockResolvedValueOnce(simulationSuccess([]));
+    const all = await sorobanGetAllBallots(makeConfig());
+    expect(all).toEqual([]);
+  });
+
+  it("returns empty array for invalid contract ID", async () => {
+    const all = await sorobanGetAllBallots(makeConfig({ contractId: "bad-id" }));
+    expect(all).toEqual([]);
+    expect(mockRpc.simulateTransaction).not.toHaveBeenCalled();
+  });
+});
+
+describe("sorobanBallotIsActive — view function", () => {
+  it("returns true for an active ballot", async () => {
+    mockRpc.simulateTransaction.mockResolvedValueOnce(simulationSuccess(true));
+    const active = await sorobanBallotIsActive(makeConfig(), "ballot-1");
+    expect(active).toBe(true);
+  });
+
+  it("returns false for a finalized or non-existent ballot", async () => {
+    mockRpc.simulateTransaction.mockResolvedValueOnce(simulationSuccess(false));
+    const active = await sorobanBallotIsActive(makeConfig(), "ballot-1");
+    expect(active).toBe(false);
+  });
+
+  it("returns null for invalid contract ID", async () => {
+    const active = await sorobanBallotIsActive(makeConfig({ contractId: "bad-id" }), "ballot-1");
+    expect(active).toBeNull();
+    expect(mockRpc.simulateTransaction).not.toHaveBeenCalled();
+  });
+});
+
+describe("sorobanIsBallotFinalized — view function", () => {
+  it("returns true when result has been published", async () => {
+    mockRpc.simulateTransaction.mockResolvedValueOnce(simulationSuccess(true));
+    const finalized = await sorobanIsBallotFinalized(makeConfig(), "ballot-1");
+    expect(finalized).toBe(true);
+  });
+
+  it("returns false when no result published", async () => {
+    mockRpc.simulateTransaction.mockResolvedValueOnce(simulationSuccess(false));
+    const finalized = await sorobanIsBallotFinalized(makeConfig(), "ballot-1");
+    expect(finalized).toBe(false);
+  });
+
+  it("returns null for invalid contract ID", async () => {
+    const finalized = await sorobanIsBallotFinalized(makeConfig({ contractId: "bad-id" }), "ballot-1");
+    expect(finalized).toBeNull();
+    expect(mockRpc.simulateTransaction).not.toHaveBeenCalled();
   });
 });
 
@@ -577,6 +690,11 @@ describe("createSorobanService", () => {
     expect(service).toHaveProperty("sorobanGetBallotCreatedAt");
     expect(service).toHaveProperty("sorobanGetAuditReport");
     expect(service).toHaveProperty("sorobanVerifyResultProof");
+    expect(service).toHaveProperty("sorobanGetBallotMetadata");
+    expect(service).toHaveProperty("sorobanGetBallotStats");
+    expect(service).toHaveProperty("sorobanGetAllBallots");
+    expect(service).toHaveProperty("sorobanBallotIsActive");
+    expect(service).toHaveProperty("sorobanIsBallotFinalized");
     expect(service).toHaveProperty("sorobanGetBallotExpiration");
     expect(service).toHaveProperty("sorobanScheduleUpgrade");
     expect(service).toHaveProperty("sorobanCancelUpgrade");
