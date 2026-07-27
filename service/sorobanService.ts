@@ -264,6 +264,33 @@ export interface BallotAuditReport {
   votes_cast: number;
 }
 
+/**
+ * Result of a post-finalization consistency check between the on-chain
+ * AnonVote contract and the backend database.
+ *
+ * `consistent` reflects the contract's own `is_consistent` view
+ * (tokens_issued == votes_cast on-chain). When `databaseVoteCount` is
+ * supplied, the report additionally flags `databaseMatchesChain` so a
+ * caller can distinguish "contract counters agree with each other" from
+ * "the database tally agrees with the chain" — the two are independent
+ * checks and either can fail on its own.
+ */
+export interface BallotConsistencyReport {
+  ballotIdHash: string;
+  /** True if the contract's tokens_issued == votes_cast, per is_consistent. */
+  consistent: boolean;
+  tokensIssuedOnChain: number | null;
+  votesCastOnChain: number | null;
+  /** Vote count from the backend database, if provided by the caller. */
+  votesCastInDatabase: number | null;
+  /** True if votesCastInDatabase matches votesCastOnChain; null if not compared. */
+  databaseMatchesChain: boolean | null;
+  /** Unix seconds when the check was performed. */
+  checkedAt: number;
+  /** Set when the contract could not be reached or the config is invalid. */
+  error?: string;
+}
+
 export interface MerkleProof {
   vote_hash: string;
   path: string[];
@@ -1090,6 +1117,113 @@ export async function sorobanGetAuditCounts(
     tokensIssued: (tokensRes.value ?? null) as number | null,
     votesCast:    (votesRes.value  ?? null) as number | null,
     isConsistent: (consistentRes.value as boolean) ?? false,
+  };
+}
+
+/**
+ * Verify that a ballot's on-chain vote count is consistent, calling the
+ * contract's `is_consistent` view function (tokens_issued == votes_cast).
+ *
+ * This is a read-only, on-demand check intended to run as a post-finalization
+ * step (e.g. right after a tally is written to the database) — it never
+ * submits a transaction and never throws. If the contract is unreachable or
+ * misconfigured, `error` is set and `consistent` defaults to `false` so a
+ * caller cannot mistake "couldn't check" for "verified consistent".
+ *
+ * Pass `databaseVoteCount` (the vote count the backend tallied) to also get
+ * an independent `databaseMatchesChain` comparison against the on-chain
+ * vote count, logged alongside the on-chain result for transparency.
+ *
+ * Verification failures (or unreachable contracts) are logged as warnings/
+ * errors but never throw — callers should treat this as informational and
+ * must not fail tally finalization on a `false` or errored result.
+ */
+export async function verifyBallotConsistency(
+  config: SorobanConfig,
+  ballotIdHash: string,
+  databaseVoteCount?: number,
+): Promise<BallotConsistencyReport> {
+  const checkedAt = Math.floor(Date.now() / 1000);
+
+  const contractCheck = validateContractId(config.contractId);
+  if (!contractCheck.valid) {
+    console.warn(
+      `[Soroban] verifyBallotConsistency: ${contractCheck.error.message} (ballot ${ballotIdHash})`,
+    );
+    return {
+      ballotIdHash,
+      consistent: false,
+      tokensIssuedOnChain: null,
+      votesCastOnChain: null,
+      votesCastInDatabase: databaseVoteCount ?? null,
+      databaseMatchesChain: null,
+      checkedAt,
+      error: contractCheck.error.message,
+    };
+  }
+
+  const [tokensRes, votesRes, consistentRes] = await Promise.all([
+    readContract(config, "get_tokens_issued", [{ value: ballotIdHash, type: "string" }]),
+    readContract(config, "get_votes_cast", [{ value: ballotIdHash, type: "string" }]),
+    readContract(config, "is_consistent", [{ value: ballotIdHash, type: "string" }]),
+  ]);
+
+  const failedRead = [tokensRes, votesRes, consistentRes].find(
+    (r) => r.errorCode !== undefined,
+  );
+  if (failedRead) {
+    console.error(
+      `[Soroban] verifyBallotConsistency: contract unreachable for ballot ${ballotIdHash} — ${failedRead.errorMessage}`,
+    );
+    return {
+      ballotIdHash,
+      consistent: false,
+      tokensIssuedOnChain: null,
+      votesCastOnChain: null,
+      votesCastInDatabase: databaseVoteCount ?? null,
+      databaseMatchesChain: null,
+      checkedAt,
+      error: failedRead.errorMessage ?? "Contract read failed",
+    };
+  }
+
+  const tokensIssuedOnChain = (tokensRes.value ?? null) as number | null;
+  const votesCastOnChain = (votesRes.value ?? null) as number | null;
+  const consistent = (consistentRes.value as boolean) ?? false;
+
+  const databaseMatchesChain =
+    databaseVoteCount === undefined || votesCastOnChain === null
+      ? null
+      : databaseVoteCount === votesCastOnChain;
+
+  const summary =
+    `tokens_issued(chain)=${tokensIssuedOnChain}, votes_cast(chain)=${votesCastOnChain}` +
+    (databaseVoteCount !== undefined ? `, votes_cast(db)=${databaseVoteCount}` : "");
+
+  if (consistent) {
+    console.log(
+      `[Soroban] verifyBallotConsistency: ballot ${ballotIdHash} is consistent on-chain — ${summary}`,
+    );
+  } else {
+    console.warn(
+      `[Soroban] verifyBallotConsistency: ballot ${ballotIdHash} is INCONSISTENT on-chain — ${summary}`,
+    );
+  }
+
+  if (databaseMatchesChain === false) {
+    console.warn(
+      `[Soroban] verifyBallotConsistency: database vote count (${databaseVoteCount}) does not match on-chain vote count (${votesCastOnChain}) for ballot ${ballotIdHash}`,
+    );
+  }
+
+  return {
+    ballotIdHash,
+    consistent,
+    tokensIssuedOnChain,
+    votesCastOnChain,
+    votesCastInDatabase: databaseVoteCount ?? null,
+    databaseMatchesChain,
+    checkedAt,
   };
 }
 
