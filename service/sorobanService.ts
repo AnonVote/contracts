@@ -21,8 +21,120 @@
 
 import * as StellarSdk from "stellar-sdk";
 
-const SOROBAN_RPC_TESTNET = "https://soroban-testnet.stellar.org";
-const SOROBAN_RPC_MAINNET = "https://rpc.stellar.org";
+// ── SorobanServiceError — throwable typed error for callers ──────────────────
+
+/**
+ * Error codes for the throwable SorobanServiceError.
+ * Distinct from SorobanErrorCode (which mirrors on-chain contract codes) —
+ * these four codes represent the service-level failure categories callers
+ * need to distinguish for retry/alerting decisions.
+ *
+ * Retryability:
+ *   NETWORK_ERROR        → true  (transient — network glitch, DNS, TCP reset)
+ *   SIMULATION_FAILED    → true  (transient — RPC timeout, overloaded node)
+ *   TRANSACTION_FAILED   → false (requires investigation; may be idempotent)
+ *   CONTRACT_ERROR       → false (logic error in the call; retry is wrong)
+ */
+export enum SorobanServiceErrorCode {
+  NETWORK_ERROR      = "NETWORK_ERROR",
+  CONTRACT_ERROR     = "CONTRACT_ERROR",
+  SIMULATION_FAILED  = "SIMULATION_FAILED",
+  TRANSACTION_FAILED = "TRANSACTION_FAILED",
+}
+
+/**
+ * Retryable flag per service error code.
+ * Network errors and simulation timeouts are transient — callers should retry
+ * them (with backoff). Contract logic errors and transaction failures are
+ * deterministic — retrying them will produce the same result.
+ */
+export const SOROBAN_SERVICE_ERROR_RETRYABLE: Record<SorobanServiceErrorCode, boolean> = {
+  [SorobanServiceErrorCode.NETWORK_ERROR]:      true,
+  [SorobanServiceErrorCode.SIMULATION_FAILED]:  true,
+  [SorobanServiceErrorCode.TRANSACTION_FAILED]: false,
+  [SorobanServiceErrorCode.CONTRACT_ERROR]:     false,
+};
+
+/**
+ * Typed throwable error surfaced by all AnonVote Soroban service helpers.
+ *
+ * `code`      — service-level failure category (see SorobanServiceErrorCode)
+ * `retryable` — true when the failure is transient and retrying with backoff
+ *               is safe; false when retrying would produce the same result
+ * `contractErrorCode` — the underlying on-chain contract error code when
+ *               `code === CONTRACT_ERROR`, undefined otherwise; intended for
+ *               internal logging only — do not surface in API responses
+ *
+ * @example
+ * ```ts
+ * try {
+ *   await sorobanRecordBallot(config, ballotIdHash);
+ * } catch (err) {
+ *   if (err instanceof SorobanServiceError && err.retryable) {
+ *     // enqueue for retry
+ *   }
+ * }
+ * ```
+ */
+export class SorobanServiceError extends Error {
+  readonly code: SorobanServiceErrorCode;
+  readonly retryable: boolean;
+  /** On-chain contract error code — for internal logging only. */
+  readonly contractErrorCode?: SorobanErrorCode;
+
+  constructor(
+    code: SorobanServiceErrorCode,
+    message: string,
+    contractErrorCode?: SorobanErrorCode,
+  ) {
+    super(message);
+    this.name = "SorobanServiceError";
+    this.code = code;
+    this.retryable = SOROBAN_SERVICE_ERROR_RETRYABLE[code];
+    this.contractErrorCode = contractErrorCode;
+    // Ensure instanceof works correctly when transpiled to ES5
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+/**
+ * Map a failed SorobanInvokeResult onto a SorobanServiceError and throw it.
+ * Called by all public helpers after a non-success result from invokeContract.
+ * Logs full internal details before throwing — callers should NOT log these
+ * details in API responses.
+ */
+function throwFromInvokeResult(method: string, result: SorobanInvokeResult): never {
+  const { errorCode, errorMessage } = result;
+  // Internal log — full details are safe here, not exposed to clients
+  console.error(
+    `[Soroban] ${method} threw SorobanServiceError — code: ${errorCode !== undefined ? SorobanErrorCode[errorCode] : "unknown"}, message: ${errorMessage ?? "(none)"}`,
+  );
+
+  if (errorCode === SorobanErrorCode.NetworkError) {
+    throw new SorobanServiceError(
+      SorobanServiceErrorCode.NETWORK_ERROR,
+      "Stellar network or RPC endpoint is unavailable",
+    );
+  }
+  if (errorCode === SorobanErrorCode.SimulationFailed) {
+    throw new SorobanServiceError(
+      SorobanServiceErrorCode.SIMULATION_FAILED,
+      "Transaction simulation failed — the RPC node may be overloaded",
+    );
+  }
+  if (errorCode === SorobanErrorCode.TransactionFailed) {
+    throw new SorobanServiceError(
+      SorobanServiceErrorCode.TRANSACTION_FAILED,
+      "Transaction submission or confirmation failed",
+    );
+  }
+  // All other codes (contract logic errors: BallotNotFound, BallotAlreadyExists, etc.)
+  throw new SorobanServiceError(
+    SorobanServiceErrorCode.CONTRACT_ERROR,
+    errorMessage ?? "Contract call failed",
+    errorCode,
+  );
+}
 
 // ── Error codes matching ContractError enum in lib.rs ─────────────────────────
 
@@ -105,10 +217,10 @@ export const DEFAULT_RETRY_POLICY: RetryPolicy = {
 };
 
 export interface SorobanConfig {
-  stellarSecretKey: string;
-  stellarNetwork: "testnet" | "mainnet";
+  rpcUrl: string;
+  networkPassphrase: string;
   contractId: string;
-  rpcServer?: Pick<StellarSdk.SorobanRpc.Server, "getEvents"> | undefined;
+  sourceKeypair: StellarSdk.Keypair;
   /** Optional override for the transaction-confirmation retry/backoff strategy. */
   retryPolicy?: RetryPolicy;
 }
@@ -199,7 +311,7 @@ export interface SorobanEventData {
 // ── Config validation ──────────────────────────────────────────────────────
 
 export interface ConfigError {
-  field: "stellarSecretKey" | "contractId";
+  field: "sourceKeypair" | "contractId";
   message: string;
 }
 
@@ -224,12 +336,12 @@ export function validateContractId(
 export function validateSorobanConfig(
   config: SorobanConfig,
 ): { valid: true } | { valid: false; error: ConfigError } {
-  if (!config.stellarSecretKey || !StellarSdk.StrKey.isValidEd25519SecretSeed(config.stellarSecretKey)) {
+  if (!config.sourceKeypair || !config.sourceKeypair.publicKey()) {
     return {
       valid: false,
       error: {
-        field: "stellarSecretKey",
-        message: "Invalid stellarSecretKey format",
+        field: "sourceKeypair",
+        message: "Invalid sourceKeypair — must be a valid Keypair instance",
       },
     };
   }
@@ -243,22 +355,6 @@ export function validateSorobanConfig(
 export interface BallotLimits {
   maxTokens: number;
   maxVotes: number;
-}
-
-function getRpcUrl(network: string): string {
-  return network === "mainnet" ? SOROBAN_RPC_MAINNET : SOROBAN_RPC_TESTNET;
-}
-
-function getNetworkPassphrase(network: string): string {
-  return network === "mainnet"
-    ? StellarSdk.Networks.PUBLIC
-    : StellarSdk.Networks.TESTNET;
-}
-
-function getRpcServer(network: string): StellarSdk.SorobanRpc.Server {
-  return new StellarSdk.SorobanRpc.Server(getRpcUrl(network), {
-    allowHttp: false,
-  });
 }
 
 function makeError(code: SorobanErrorCode): Pick<SorobanInvokeResult, "errorCode" | "errorMessage"> {
@@ -488,8 +584,8 @@ export async function invokeContract(
   }
 
   try {
-    const keypair = StellarSdk.Keypair.fromSecret(config.stellarSecretKey);
-    const server   = getRpcServer(config.stellarNetwork);
+    const keypair = config.sourceKeypair;
+    const server   = new StellarSdk.SorobanRpc.Server(config.rpcUrl, { allowHttp: false });
     const account  = await server.getAccount(keypair.publicKey());
 
     const scArgs   = args.map(({ value, type }) =>
@@ -501,7 +597,7 @@ export async function invokeContract(
 
     const tx = new StellarSdk.TransactionBuilder(account, {
       fee: StellarSdk.BASE_FEE,
-      networkPassphrase: getNetworkPassphrase(config.stellarNetwork),
+      networkPassphrase: config.networkPassphrase,
     })
       .addOperation(operation)
       .setTimeout(30)
@@ -587,17 +683,14 @@ export async function readContract(
     console.warn(`[Soroban] ${method}: invalid config — ${contractCheck.error.message}`);
     return { value: null, ...makeError(SorobanErrorCode.NotConfigured) };
   }
-  if (config.stellarSecretKey && !StellarSdk.StrKey.isValidEd25519SecretSeed(config.stellarSecretKey)) {
-    console.warn(`[Soroban] ${method}: invalid stellarSecretKey format`);
+  if (!config.sourceKeypair) {
+    console.warn(`[Soroban] ${method}: invalid sourceKeypair — must be a valid Keypair instance`);
     return { value: null, ...makeError(SorobanErrorCode.NotConfigured) };
   }
 
   try {
-    const keypair = config.stellarSecretKey
-      ? StellarSdk.Keypair.fromSecret(config.stellarSecretKey)
-      : StellarSdk.Keypair.random();
-
-    const server  = getRpcServer(config.stellarNetwork);
+    const keypair = config.sourceKeypair;
+    const server  = new StellarSdk.SorobanRpc.Server(config.rpcUrl, { allowHttp: false });
     const account = await server.getAccount(keypair.publicKey());
 
     const scArgs  = args.map(({ value, type }) =>
@@ -609,7 +702,7 @@ export async function readContract(
 
     const tx = new StellarSdk.TransactionBuilder(account, {
       fee: StellarSdk.BASE_FEE,
-      networkPassphrase: getNetworkPassphrase(config.stellarNetwork),
+      networkPassphrase: config.networkPassphrase,
     })
       .addOperation(operation)
       .setTimeout(30)
@@ -657,7 +750,7 @@ export async function sorobanFilterEvents(
   }
 
   try {
-    const server = config.rpcServer ?? getRpcServer(config.stellarNetwork);
+    const server = new StellarSdk.SorobanRpc.Server(config.rpcUrl, { allowHttp: false });
     const events: SorobanEventData[] = [];
     let cursor: string | undefined;
     let pages = 0;
@@ -722,7 +815,7 @@ export async function sorobanRecordBallot(
     console.warn(`[Soroban] sorobanRecordBallot: ${configCheck.error.message}`);
     return { txHash: "", success: false, ...makeError(SorobanErrorCode.NotConfigured) };
   }
-  const caller = StellarSdk.Keypair.fromSecret(config.stellarSecretKey).publicKey();
+  const caller = config.sourceKeypair.publicKey();
   const ballotLimits = limits ?? { maxTokens: 10000, maxVotes: 10000 };
   const result = await invokeContract(config, "record_ballot", [
     { value: caller, type: "address" },
@@ -732,10 +825,8 @@ export async function sorobanRecordBallot(
       type: "map",
     },
   ]);
-  if (!result.success && result.errorCode !== undefined) {
-    console.error(
-      `[Soroban] sorobanRecordBallot failed — ${SorobanErrorCode[result.errorCode]}: ${result.errorMessage}`,
-    );
+  if (!result.success) {
+    throwFromInvokeResult("sorobanRecordBallot", result);
   }
   return result;
 }
@@ -763,7 +854,7 @@ export async function sorobanRecordBallotsBatch(
     return { txHash: "", success: false, ...makeError(SorobanErrorCode.NotConfigured) };
   }
 
-  const caller = StellarSdk.Keypair.fromSecret(config.stellarSecretKey).publicKey();
+  const caller = config.sourceKeypair.publicKey();
 
   // Build the Vec<(String, BallotLimits)> argument expected by record_ballots_batch.
   // Each element is a 2-tuple encoded as a map with the Soroban SDK.
@@ -780,10 +871,8 @@ export async function sorobanRecordBallotsBatch(
     { value: ballotsArg, type: "vec" },
   ]);
 
-  if (!result.success && result.errorCode !== undefined) {
-    console.error(
-      `[Soroban] sorobanRecordBallotsBatch failed — ${SorobanErrorCode[result.errorCode]}: ${result.errorMessage}`,
-    );
+  if (!result.success) {
+    throwFromInvokeResult("sorobanRecordBallotsBatch", result);
   }
 
   return result;
@@ -802,21 +891,13 @@ export async function sorobanRecordToken(
     console.warn(`[Soroban] sorobanRecordToken: ${configCheck.error.message}`);
     return { txHash: "", success: false, ...makeError(SorobanErrorCode.NotConfigured) };
   }
-  const caller = StellarSdk.Keypair.fromSecret(config.stellarSecretKey).publicKey();
+  const caller = config.sourceKeypair.publicKey();
   const result = await invokeContract(config, "record_token", [
     { value: caller, type: "address" },
     { value: ballotIdHash, type: "string" },
   ]);
   if (!result.success) {
-    if (result.errorCode === SorobanErrorCode.BallotNotFound) {
-      console.error(
-        `[Soroban] sorobanRecordToken: ballot ${ballotIdHash} not found on-chain — BallotNotFound`,
-      );
-    } else if (result.errorCode !== undefined) {
-      console.error(
-        `[Soroban] sorobanRecordToken failed — ${SorobanErrorCode[result.errorCode]}: ${result.errorMessage}`,
-      );
-    }
+    throwFromInvokeResult("sorobanRecordToken", result);
   }
   return result;
 }
@@ -834,21 +915,13 @@ export async function sorobanRecordVote(
     console.warn(`[Soroban] sorobanRecordVote: ${configCheck.error.message}`);
     return { txHash: "", success: false, ...makeError(SorobanErrorCode.NotConfigured) };
   }
-  const caller = StellarSdk.Keypair.fromSecret(config.stellarSecretKey).publicKey();
+  const caller = config.sourceKeypair.publicKey();
   const result = await invokeContract(config, "record_vote", [
     { value: caller, type: "address" },
     { value: ballotIdHash, type: "string" },
   ]);
   if (!result.success) {
-    if (result.errorCode === SorobanErrorCode.BallotNotFound) {
-      console.error(
-        `[Soroban] sorobanRecordVote: ballot ${ballotIdHash} not found on-chain — BallotNotFound`,
-      );
-    } else if (result.errorCode !== undefined) {
-      console.error(
-        `[Soroban] sorobanRecordVote failed — ${SorobanErrorCode[result.errorCode]}: ${result.errorMessage}`,
-      );
-    }
+    throwFromInvokeResult("sorobanRecordVote", result);
   }
   return result;
 }
@@ -869,7 +942,7 @@ export async function sorobanRecordResult(
     console.warn(`[Soroban] sorobanRecordResult: ${configCheck.error.message}`);
     return { txHash: "", success: false, ...makeError(SorobanErrorCode.NotConfigured) };
   }
-  const caller = StellarSdk.Keypair.fromSecret(config.stellarSecretKey).publicKey();
+  const caller = config.sourceKeypair.publicKey();
   const result = await invokeContract(config, "record_result", [
     { value: caller, type: "address" },
     { value: ballotIdHash, type: "string" },
@@ -887,16 +960,15 @@ export async function sorobanRecordResult(
       );
       return { txHash: "", success: true, returnValue: onChainHash };
     }
+    // Conflicting result — not retryable, log internally and throw
     console.error(
       `[Soroban] sorobanRecordResult: conflicting result already published for ballot ${ballotIdHash}`,
     );
-    return result;
+    throwFromInvokeResult("sorobanRecordResult", result);
   }
 
-  if (!result.success && result.errorCode !== undefined) {
-    console.error(
-      `[Soroban] sorobanRecordResult failed — ${SorobanErrorCode[result.errorCode]}: ${result.errorMessage}`,
-    );
+  if (!result.success) {
+    throwFromInvokeResult("sorobanRecordResult", result);
   }
   return result;
 }
@@ -915,7 +987,7 @@ export async function sorobanRotateAdmin(
     console.warn(`[Soroban] sorobanRotateAdmin: ${configCheck.error.message}`);
     return { txHash: "", success: false, ...makeError(SorobanErrorCode.NotConfigured) };
   }
-  const caller = StellarSdk.Keypair.fromSecret(config.stellarSecretKey).publicKey();
+  const caller = config.sourceKeypair.publicKey();
   const result = await invokeContract(config, "rotate_admin", [
     { value: caller, type: "address" },
     { value: newAdminPublicKey, type: "address" },
@@ -964,7 +1036,7 @@ export async function sorobanTransitionBallotState(
     console.warn(`[Soroban] sorobanTransitionBallotState: ${configCheck.error.message}`);
     return { txHash: "", success: false, ...makeError(SorobanErrorCode.NotConfigured) };
   }
-  const caller = StellarSdk.Keypair.fromSecret(config.stellarSecretKey).publicKey();
+  const caller = config.sourceKeypair.publicKey();
   const result = await invokeContract(config, "transition_ballot_state", [
     { value: caller, type: "address" },
     { value: ballotIdHash, type: "string" },
@@ -1138,7 +1210,7 @@ export async function sorobanScheduleUpgrade(
     console.warn(`[Soroban] sorobanScheduleUpgrade: ${configCheck.error.message}`);
     return { txHash: "", success: false, ...makeError(SorobanErrorCode.NotConfigured) };
   }
-  const caller = StellarSdk.Keypair.fromSecret(config.stellarSecretKey).publicKey();
+  const caller = config.sourceKeypair.publicKey();
   const result = await invokeContract(config, "schedule_upgrade", [
     { value: caller, type: "address" },
     { value: newWasmHash, type: "bytes" },
@@ -1162,7 +1234,7 @@ export async function sorobanCancelUpgrade(
     console.warn(`[Soroban] sorobanCancelUpgrade: ${configCheck.error.message}`);
     return { txHash: "", success: false, ...makeError(SorobanErrorCode.NotConfigured) };
   }
-  const caller = StellarSdk.Keypair.fromSecret(config.stellarSecretKey).publicKey();
+  const caller = config.sourceKeypair.publicKey();
   const result = await invokeContract(config, "cancel_upgrade", [
     { value: caller, type: "address" },
   ]);
@@ -1204,4 +1276,155 @@ export async function sorobanGetPendingUpgrade(
   if (!contractCheck.valid) return null;
   const { value } = await readContract(config, "get_pending_upgrade", []);
   return value as { newWasmHash: string; scheduledAt: number; executableAt: number } | null;
+}
+
+// ── Config helpers ────────────────────────────────────────────────────────────
+
+/**
+ * Create a SorobanConfig pre-configured for Stellar testnet with sensible
+ * defaults. Callers can override any field after creation.
+ *
+ * @example
+ * ```ts
+ * const config = createDefaultTestnetConfig({
+ *   contractId: "CCX…",
+ *   sourceKeypair: Keypair.fromSecret(process.env.STELLAR_SECRET_KEY!),
+ * });
+ * ```
+ */
+export function createDefaultTestnetConfig(params: {
+  contractId: string;
+  sourceKeypair: StellarSdk.Keypair;
+  retryPolicy?: RetryPolicy;
+}): SorobanConfig {
+  return {
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    networkPassphrase: StellarSdk.Networks.TESTNET,
+    contractId: params.contractId,
+    sourceKeypair: params.sourceKeypair,
+    retryPolicy: params.retryPolicy,
+  };
+}
+
+/**
+ * Create a SorobanConfig pre-configured for Stellar mainnet with sensible
+ * defaults. Callers can override any field after creation.
+ *
+ * @example
+ * ```ts
+ * const config = createDefaultMainnetConfig({
+ *   contractId: "CCX…",
+ *   sourceKeypair: Keypair.fromSecret(process.env.STELLAR_SECRET_KEY!),
+ * });
+ * ```
+ */
+export function createDefaultMainnetConfig(params: {
+  contractId: string;
+  sourceKeypair: StellarSdk.Keypair;
+  retryPolicy?: RetryPolicy;
+}): SorobanConfig {
+  return {
+    rpcUrl: "https://soroban-mainnet.stellar.org",
+    networkPassphrase: StellarSdk.Networks.PUBLIC,
+    contractId: params.contractId,
+    sourceKeypair: params.sourceKeypair,
+    retryPolicy: params.retryPolicy,
+  };
+}
+
+// ── Factory ───────────────────────────────────────────────────────────────────
+
+/**
+ * Create a Soroban service instance bound to a specific config.
+ *
+ * All returned functions are pre-bound to `config` so callers don't need to
+ * pass it on every invocation.
+ *
+ * @example
+ * ```ts
+ * import { createSorobanService, createDefaultTestnetConfig } from "./sorobanService";
+ * import { Keypair } from "stellar-sdk";
+ *
+ * const sourceKeypair = Keypair.fromSecret(process.env.STELLAR_SECRET_KEY!);
+ * const config = createDefaultTestnetConfig({
+ *   contractId: process.env.SOROBAN_CONTRACT_ID!,
+ *   sourceKeypair,
+ * });
+ * const service = createSorobanService(config);
+ *
+ * await service.sorobanRecordBallot("hash123");
+ * ```
+ */
+export function createSorobanService(config: SorobanConfig) {
+  return {
+    invokeContract: (method: string, args: { value: unknown; type: string }[]) =>
+      invokeContract(config, method, args),
+
+    readContract: (method: string, args: { value: unknown; type: string }[]) =>
+      readContract(config, method, args),
+
+    sorobanRecordBallot: (ballotIdHash: string, limits?: BallotLimits) =>
+      sorobanRecordBallot(config, ballotIdHash, limits),
+
+    sorobanRecordBallotsBatch: (
+      ballots: Array<{ ballotIdHash: string; limits?: BallotLimits }>,
+    ) => sorobanRecordBallotsBatch(config, ballots),
+
+    sorobanRecordToken: (ballotIdHash: string) =>
+      sorobanRecordToken(config, ballotIdHash),
+
+    sorobanRecordVote: (ballotIdHash: string) =>
+      sorobanRecordVote(config, ballotIdHash),
+
+    sorobanRecordResult: (ballotIdHash: string, resultHash: string) =>
+      sorobanRecordResult(config, ballotIdHash, resultHash),
+
+    sorobanFilterEvents: (filter?: SorobanEventFilter) =>
+      sorobanFilterEvents(config, filter),
+
+    sorobanRotateAdmin: (newAdminPublicKey: string) =>
+      sorobanRotateAdmin(config, newAdminPublicKey),
+
+    sorobanGetRotationHistory: () =>
+      sorobanGetRotationHistory(config),
+
+    sorobanTransitionBallotState: (ballotIdHash: string, newState: BallotState) =>
+      sorobanTransitionBallotState(config, ballotIdHash, newState),
+
+    sorobanGetAuditCounts: (ballotIdHash: string) =>
+      sorobanGetAuditCounts(config, ballotIdHash),
+
+    sorobanResultExists: (ballotIdHash: string) =>
+      sorobanResultExists(config, ballotIdHash),
+
+    sorobanGetBallotState: (ballotIdHash: string) =>
+      sorobanGetBallotState(config, ballotIdHash),
+
+    sorobanGetBallotCreatedAt: (ballotIdHash: string) =>
+      sorobanGetBallotCreatedAt(config, ballotIdHash),
+
+    sorobanGetAuditReport: (ballotIdHash: string) =>
+      sorobanGetAuditReport(config, ballotIdHash),
+
+    sorobanVerifyResultProof: (
+      ballotIdHash: string,
+      voteMerkleProof: MerkleProof,
+      resultHash: string,
+    ) => sorobanVerifyResultProof(config, ballotIdHash, voteMerkleProof, resultHash),
+
+    sorobanGetBallotExpiration: (ballotIdHash: string) =>
+      sorobanGetBallotExpiration(config, ballotIdHash),
+
+    sorobanScheduleUpgrade: (newWasmHash: string) =>
+      sorobanScheduleUpgrade(config, newWasmHash),
+
+    sorobanCancelUpgrade: () =>
+      sorobanCancelUpgrade(config),
+
+    sorobanExecuteUpgrade: () =>
+      sorobanExecuteUpgrade(config),
+
+    sorobanGetPendingUpgrade: () =>
+      sorobanGetPendingUpgrade(config),
+  };
 }

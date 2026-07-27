@@ -15,6 +15,7 @@ vi.mock("stellar-sdk", async () => {
 });
 
 // Imported after vi.mock so sorobanService picks up the mocked stellar-sdk.
+import * as StellarSdk from "stellar-sdk";
 import {
   invokeContract,
   readContract,
@@ -27,7 +28,12 @@ import {
   sorobanRotateAdmin,
   sorobanGetRotationHistory,
   SorobanErrorCode,
+  SorobanServiceError,
+  SorobanServiceErrorCode,
   DEFAULT_RETRY_POLICY,
+  createSorobanService,
+  createDefaultTestnetConfig,
+  createDefaultMainnetConfig,
   type SorobanConfig,
 } from "./sorobanService";
 
@@ -36,9 +42,10 @@ const VALID_CONTRACT_ID = "C" + "D".repeat(55);
 
 function makeConfig(overrides: Partial<SorobanConfig> = {}): SorobanConfig {
   return {
-    stellarSecretKey: VALID_SECRET_KEY,
-    stellarNetwork: "testnet",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    networkPassphrase: "Test SDF Network ; September 2015",
     contractId: VALID_CONTRACT_ID,
+    sourceKeypair: StellarSdk.Keypair.fromSecret(VALID_SECRET_KEY),
     ...overrides,
   };
 }
@@ -52,11 +59,11 @@ afterEach(() => {
 });
 
 describe("validateSorobanConfig / validateContractId", () => {
-  it("rejects an invalid secret key format", () => {
-    const result = validateSorobanConfig(makeConfig({ stellarSecretKey: "not-a-real-key" }));
+  it("rejects an invalid sourceKeypair", () => {
+    const result = validateSorobanConfig(makeConfig({ sourceKeypair: undefined as any }));
     expect(result.valid).toBe(false);
     if (!result.valid) {
-      expect(result.error.field).toBe("stellarSecretKey");
+      expect(result.error.field).toBe("sourceKeypair");
     }
   });
 
@@ -107,9 +114,9 @@ describe("invokeContract — mocked RPC", () => {
     expect(mockRpc.sendTransaction).not.toHaveBeenCalled();
   });
 
-  it("falls back to NotConfigured without throwing when the secret key is malformed", async () => {
+  it("falls back to NotConfigured without throwing when sourceKeypair is missing", async () => {
     const result = await invokeContract(
-      makeConfig({ stellarSecretKey: "bad-secret" }),
+      makeConfig({ sourceKeypair: undefined as any }),
       "record_ballot",
       [{ value: "GADMIN", type: "address" }],
     );
@@ -220,18 +227,28 @@ describe("sorobanRecordResult — finality guard / idempotency", () => {
       // readContract for get_result_hash returns a DIFFERENT hash
       .mockResolvedValueOnce(simulationSuccess("result-hash-DIFFERENT"));
 
-    const result = await sorobanRecordResult(makeConfig(), "ballot-y", "result-hash-mine");
-    expect(result.success).toBe(false);
-    expect(result.errorCode).toBe(SorobanErrorCode.ResultAlreadyPublished);
+    await expect(
+      sorobanRecordResult(makeConfig(), "ballot-y", "result-hash-mine"),
+    ).rejects.toSatisfy(
+      (err: unknown) =>
+        err instanceof SorobanServiceError &&
+        err.code === SorobanServiceErrorCode.CONTRACT_ERROR &&
+        err.contractErrorCode === SorobanErrorCode.ResultAlreadyPublished,
+    );
     expect(mockRpc.sendTransaction).not.toHaveBeenCalled();
   });
 
   it("propagates non-finality errors (e.g. BallotNotFound) unchanged", async () => {
     mockRpc.simulateTransaction.mockResolvedValueOnce(simulationError("Error(Contract, #4)"));
 
-    const result = await sorobanRecordResult(makeConfig(), "missing-ballot", "hash");
-    expect(result.success).toBe(false);
-    expect(result.errorCode).toBe(SorobanErrorCode.BallotNotFound);
+    await expect(
+      sorobanRecordResult(makeConfig(), "missing-ballot", "hash"),
+    ).rejects.toSatisfy(
+      (err: unknown) =>
+        err instanceof SorobanServiceError &&
+        err.code === SorobanServiceErrorCode.CONTRACT_ERROR &&
+        err.contractErrorCode === SorobanErrorCode.BallotNotFound,
+    );
   });
 });
 
@@ -331,9 +348,9 @@ describe("sorobanRotateAdmin — unit tests (mocked RPC)", () => {
     expect(mockRpc.sendTransaction).not.toHaveBeenCalled();
   });
 
-  it("returns NotConfigured without calling RPC when secret key is invalid", async () => {
+  it("returns NotConfigured without calling RPC when sourceKeypair is missing", async () => {
     const result = await sorobanRotateAdmin(
-      makeConfig({ stellarSecretKey: "not-a-valid-key" }),
+      makeConfig({ sourceKeypair: undefined as any }),
       "G" + "A".repeat(55),
     );
     expect(result.success).toBe(false);
@@ -397,9 +414,14 @@ describe("sorobanRecordBallotsBatch — unit tests (mocked RPC)", () => {
   it("returns BallotAlreadyExists when any ballot in the batch already exists", async () => {
     mockRpc.simulateTransaction.mockResolvedValueOnce(simulationError("Error(Contract, #5)"));
 
-    const result = await sorobanRecordBallotsBatch(makeConfig(), ballots);
-    expect(result.success).toBe(false);
-    expect(result.errorCode).toBe(SorobanErrorCode.BallotAlreadyExists);
+    await expect(
+      sorobanRecordBallotsBatch(makeConfig(), ballots),
+    ).rejects.toSatisfy(
+      (err: unknown) =>
+        err instanceof SorobanServiceError &&
+        err.code === SorobanServiceErrorCode.CONTRACT_ERROR &&
+        err.contractErrorCode === SorobanErrorCode.BallotAlreadyExists,
+    );
     // Batch rejected at simulation — no transaction sent
     expect(mockRpc.sendTransaction).not.toHaveBeenCalled();
   });
@@ -407,36 +429,51 @@ describe("sorobanRecordBallotsBatch — unit tests (mocked RPC)", () => {
   it("returns InvalidBallotHash when any ballot has an empty hash", async () => {
     mockRpc.simulateTransaction.mockResolvedValueOnce(simulationError("Error(Contract, #8)"));
 
-    const result = await sorobanRecordBallotsBatch(makeConfig(), [
-      { ballotIdHash: "good-hash" },
-      { ballotIdHash: "" },
-    ]);
-    expect(result.success).toBe(false);
-    expect(result.errorCode).toBe(SorobanErrorCode.InvalidBallotHash);
+    await expect(
+      sorobanRecordBallotsBatch(makeConfig(), [
+        { ballotIdHash: "good-hash" },
+        { ballotIdHash: "" },
+      ]),
+    ).rejects.toSatisfy(
+      (err: unknown) =>
+        err instanceof SorobanServiceError &&
+        err.code === SorobanServiceErrorCode.CONTRACT_ERROR &&
+        err.contractErrorCode === SorobanErrorCode.InvalidBallotHash,
+    );
     expect(mockRpc.sendTransaction).not.toHaveBeenCalled();
   });
 
   it("returns ContractPaused when the contract is paused", async () => {
     mockRpc.simulateTransaction.mockResolvedValueOnce(simulationError("Error(Contract, #13)"));
 
-    const result = await sorobanRecordBallotsBatch(makeConfig(), ballots);
-    expect(result.success).toBe(false);
-    expect(result.errorCode).toBe(SorobanErrorCode.ContractPaused);
+    await expect(
+      sorobanRecordBallotsBatch(makeConfig(), ballots),
+    ).rejects.toSatisfy(
+      (err: unknown) =>
+        err instanceof SorobanServiceError &&
+        err.code === SorobanServiceErrorCode.CONTRACT_ERROR &&
+        err.contractErrorCode === SorobanErrorCode.ContractPaused,
+    );
     expect(mockRpc.sendTransaction).not.toHaveBeenCalled();
   });
 
   it("returns AdminUnauthorized when caller is not the admin", async () => {
     mockRpc.simulateTransaction.mockResolvedValueOnce(simulationError("Error(Contract, #1)"));
 
-    const result = await sorobanRecordBallotsBatch(makeConfig(), ballots);
-    expect(result.success).toBe(false);
-    expect(result.errorCode).toBe(SorobanErrorCode.AdminUnauthorized);
+    await expect(
+      sorobanRecordBallotsBatch(makeConfig(), ballots),
+    ).rejects.toSatisfy(
+      (err: unknown) =>
+        err instanceof SorobanServiceError &&
+        err.code === SorobanServiceErrorCode.CONTRACT_ERROR &&
+        err.contractErrorCode === SorobanErrorCode.AdminUnauthorized,
+    );
     expect(mockRpc.sendTransaction).not.toHaveBeenCalled();
   });
 
-  it("returns NotConfigured without calling RPC when the secret key is invalid", async () => {
+  it("returns NotConfigured without calling RPC when sourceKeypair is missing", async () => {
     const result = await sorobanRecordBallotsBatch(
-      makeConfig({ stellarSecretKey: "not-a-real-key" }),
+      makeConfig({ sourceKeypair: undefined as any }),
       ballots,
     );
     expect(result.success).toBe(false);
@@ -457,8 +494,165 @@ describe("sorobanRecordBallotsBatch — unit tests (mocked RPC)", () => {
   it("returns NetworkError without throwing when the RPC call rejects", async () => {
     mockRpc.simulateTransaction.mockRejectedValueOnce(new Error("connection refused"));
 
-    const result = await sorobanRecordBallotsBatch(makeConfig(), ballots);
-    expect(result.success).toBe(false);
-    expect(result.errorCode).toBe(SorobanErrorCode.NetworkError);
+    await expect(
+      sorobanRecordBallotsBatch(makeConfig(), ballots),
+    ).rejects.toSatisfy(
+      (err: unknown) =>
+        err instanceof SorobanServiceError &&
+        err.code === SorobanServiceErrorCode.NETWORK_ERROR &&
+        err.retryable === true,
+    );
+  });
+});
+
+// ── Config helpers ──────────────────────────────────────────────────────────────
+
+describe("createDefaultTestnetConfig", () => {
+  it("returns a config with testnet RPC URL and passphrase", () => {
+    const sourceKeypair = StellarSdk.Keypair.fromSecret(VALID_SECRET_KEY);
+    const config = createDefaultTestnetConfig({
+      contractId: VALID_CONTRACT_ID,
+      sourceKeypair,
+    });
+    expect(config.rpcUrl).toBe("https://soroban-testnet.stellar.org");
+    expect(config.networkPassphrase).toBe("Test SDF Network ; September 2015");
+    expect(config.contractId).toBe(VALID_CONTRACT_ID);
+    expect(config.sourceKeypair).toBe(sourceKeypair);
+    expect(config.retryPolicy).toBeUndefined();
+  });
+
+  it("accepts an optional retryPolicy override", () => {
+    const sourceKeypair = StellarSdk.Keypair.fromSecret(VALID_SECRET_KEY);
+    const retryPolicy = { maxAttempts: 3, initialDelayMs: 100, backoffMultiplier: 2 };
+    const config = createDefaultTestnetConfig({
+      contractId: VALID_CONTRACT_ID,
+      sourceKeypair,
+      retryPolicy,
+    });
+    expect(config.retryPolicy).toEqual(retryPolicy);
+  });
+
+  it("produces a config validatable by validateSorobanConfig", () => {
+    const sourceKeypair = StellarSdk.Keypair.fromSecret(VALID_SECRET_KEY);
+    const config = createDefaultTestnetConfig({
+      contractId: VALID_CONTRACT_ID,
+      sourceKeypair,
+    });
+    expect(validateSorobanConfig(config)).toEqual({ valid: true });
+  });
+});
+
+describe("createDefaultMainnetConfig", () => {
+  it("returns a config with mainnet RPC URL and passphrase", () => {
+    const sourceKeypair = StellarSdk.Keypair.fromSecret(VALID_SECRET_KEY);
+    const config = createDefaultMainnetConfig({
+      contractId: VALID_CONTRACT_ID,
+      sourceKeypair,
+    });
+    expect(config.rpcUrl).toBe("https://soroban-mainnet.stellar.org");
+    expect(config.networkPassphrase).toBe("Public Global Stellar Network ; September 2015");
+    expect(config.contractId).toBe(VALID_CONTRACT_ID);
+    expect(config.sourceKeypair).toBe(sourceKeypair);
+  });
+});
+
+// ── Factory ─────────────────────────────────────────────────────────────────────
+
+describe("createSorobanService", () => {
+  it("returns an object with all expected methods", () => {
+    const config = makeConfig();
+    const service = createSorobanService(config);
+    expect(service).toHaveProperty("sorobanRecordBallot");
+    expect(service).toHaveProperty("sorobanRecordBallotsBatch");
+    expect(service).toHaveProperty("sorobanRecordToken");
+    expect(service).toHaveProperty("sorobanRecordVote");
+    expect(service).toHaveProperty("sorobanRecordResult");
+    expect(service).toHaveProperty("sorobanFilterEvents");
+    expect(service).toHaveProperty("sorobanRotateAdmin");
+    expect(service).toHaveProperty("sorobanGetRotationHistory");
+    expect(service).toHaveProperty("sorobanTransitionBallotState");
+    expect(service).toHaveProperty("sorobanGetAuditCounts");
+    expect(service).toHaveProperty("sorobanResultExists");
+    expect(service).toHaveProperty("sorobanGetBallotState");
+    expect(service).toHaveProperty("sorobanGetBallotCreatedAt");
+    expect(service).toHaveProperty("sorobanGetAuditReport");
+    expect(service).toHaveProperty("sorobanVerifyResultProof");
+    expect(service).toHaveProperty("sorobanGetBallotExpiration");
+    expect(service).toHaveProperty("sorobanScheduleUpgrade");
+    expect(service).toHaveProperty("sorobanCancelUpgrade");
+    expect(service).toHaveProperty("sorobanExecuteUpgrade");
+    expect(service).toHaveProperty("sorobanGetPendingUpgrade");
+    expect(service).toHaveProperty("invokeContract");
+    expect(service).toHaveProperty("readContract");
+  });
+
+  it("binds sorobanRecordBallot to config so callers don't pass it", async () => {
+    mockRpc.simulateTransaction.mockResolvedValueOnce(simulationSuccess());
+    mockRpc.sendTransaction.mockResolvedValueOnce({ status: "PENDING", hash: "tx-factory" });
+    mockRpc.getTransaction.mockResolvedValueOnce(txSuccess());
+
+    const service = createSorobanService(makeConfig());
+    const result = await service.sorobanRecordBallot("hash-factory");
+
+    expect(result.success).toBe(true);
+    expect(result.txHash).toBe("tx-factory");
+  });
+
+  it("binds sorobanResultExists to config so callers don't pass it", async () => {
+    mockRpc.simulateTransaction.mockResolvedValueOnce(simulationSuccess(true));
+
+    const service = createSorobanService(makeConfig());
+    const result = await service.sorobanResultExists("ballot-exists");
+
+    expect(result).toBe(true);
+  });
+
+  it("binds invokeContract to config", async () => {
+    mockRpc.simulateTransaction.mockResolvedValueOnce(simulationSuccess());
+    mockRpc.sendTransaction.mockResolvedValueOnce({ status: "PENDING", hash: "tx-bound" });
+    mockRpc.getTransaction.mockResolvedValueOnce(txSuccess());
+
+    const service = createSorobanService(makeConfig());
+    const result = await service.invokeContract("record_ballot", [
+      { value: "GADMIN", type: "address" },
+      { value: "hash1", type: "string" },
+    ]);
+
+    expect(result.success).toBe(true);
+    expect(result.txHash).toBe("tx-bound");
+  });
+
+  it("binds readContract to config", async () => {
+    mockRpc.simulateTransaction.mockResolvedValueOnce(simulationSuccess(42));
+
+    const service = createSorobanService(makeConfig());
+    const { value } = await service.readContract("get_tokens_issued", [
+      { value: "hash1", type: "string" },
+    ]);
+
+    expect(value).toBe(42);
+  });
+
+  it("throws SorobanServiceError on network error through bound methods", async () => {
+    mockRpc.simulateTransaction.mockRejectedValueOnce(new Error("connection timeout"));
+
+    const service = createSorobanService(makeConfig());
+
+    await expect(service.sorobanRecordBallot("hash-err")).rejects.toSatisfy(
+      (err: unknown) =>
+        err instanceof SorobanServiceError &&
+        err.code === SorobanServiceErrorCode.NETWORK_ERROR,
+    );
+  });
+
+  it("creates independent services with different configs", async () => {
+    const keypairA = StellarSdk.Keypair.fromSecret(VALID_SECRET_KEY);
+    const keypairB = StellarSdk.Keypair.fromSecret("S" + "C".repeat(55));
+
+    const configA = createDefaultTestnetConfig({ contractId: "C" + "A".repeat(55), sourceKeypair: keypairA });
+    const configB = createDefaultTestnetConfig({ contractId: "C" + "B".repeat(55), sourceKeypair: keypairB });
+
+    expect(configA.contractId).not.toBe(configB.contractId);
+    expect(configA.sourceKeypair.publicKey()).not.toBe(configB.sourceKeypair.publicKey());
   });
 });

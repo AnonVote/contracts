@@ -54,31 +54,65 @@ cargo test
 
 ---
 
-## Deploy to Testnet
+## Deploy
+
+### Prerequisites
+
+- [Rust](https://rustup.rs/) with the `wasm32-unknown-unknown` target
+- [Stellar CLI](https://github.com/stellar/stellar-cli)
+- `jq` installed
+- A Stellar account funded with testnet/mainnet XLM
+
+### Environment variables
+
+Copy `.env.example` to `.env` and fill in:
 
 ```bash
-# Deploy the contract
-stellar contract deploy \
-  --wasm target/wasm32-unknown-unknown/release/anonvote.wasm \
-  --source SBQE4MLYZGNOQOXHTHHKGR6L6YZ72HTRY6TDDMKS5FMESKPG27O4HK7K \
-  --network testnet
-
-# Output: CONTRACT_ID (e.g. CABC123...)
-# Add to backend/.env:
-# SOROBAN_CONTRACT_ID=CABC123...
+cp .env.example .env
 ```
 
----
+| Variable | Required | Description |
+|---|---|---|---|
+| `STELLAR_SECRET_KEY` | Yes | Admin secret key for signing the deploy transaction |
+| `SOROBAN_RPC_URL_TESTNET` | No | Testnet RPC endpoint — defaults to `https://soroban-testnet.stellar.org` |
+| `SOROBAN_RPC_URL_MAINNET` | No | Mainnet RPC endpoint — defaults to `https://soroban-mainnet.stellar.org` |
 
-## Initialize after deployment
+### Deploy to testnet
 
 ```bash
-stellar contract invoke \
-  --id <CONTRACT_ID> \
-  --source SBQE4MLYZGNOQOXHTHHKGR6L6YZ72HTRY6TDDMKS5FMESKPG27O4HK7K \
-  --network testnet \
-  -- initialize \
-  --admin GCSL4DBZNKTBNA4FGWFSCWFC4GDCMYAUKD6BISRJHIU4V4K5WVNYOLBN
+source .env
+./deploy.sh testnet
+```
+
+### Deploy to mainnet
+
+```bash
+source .env
+./deploy.sh mainnet
+```
+
+### What the script does
+
+1. Builds the WASM binary
+2. Deploys to the specified Stellar network
+3. Initializes the contract with the derived admin address
+4. Records contract ID, WASM hash, git commit, and timestamp in `deployments.json`
+5. Creates a git tag (`contract-testnet-v1.0.0` or `contract-mainnet-v1.0.0`)
+6. Prints a summary with the contract ID and verification links
+
+### Verifying deployment
+
+Check the contract on Stellar Explorer:
+- Testnet: `https://stellar.expert/explorer/testnet/contract/<CONTRACT_ID>`
+- Mainnet: `https://stellar.expert/explorer/mainnet/contract/<CONTRACT_ID>`
+
+### Pushing to remote
+
+After deployment, push the tag and commit:
+
+```bash
+git push origin contract-testnet-v1.0.0
+git push origin feat/contract-deployment-script
 ```
 
 ---
@@ -93,6 +127,92 @@ Once deployed, update `backend/src/services/sorobanService.ts` calls in:
 - `backend/src/services/resultEngine.ts` — call `invokeContract(id, "record_result", [...])`
 
 The `ballot_id_hash` argument should be `hashIdentifier(ballotId)` — the same SHA-256 function already used in the backend.
+
+## Usage
+
+### Factory API (recommended)
+
+The preferred way to use the service is via the `createSorobanService` factory, which creates an object with all methods pre-bound to a config:
+
+```ts
+import { Keypair } from "stellar-sdk";
+import { createSorobanService, createDefaultTestnetConfig } from "@anonvote/contracts/service";
+
+const sourceKeypair = Keypair.fromSecret(process.env.STELLAR_SECRET_KEY!);
+const config = createDefaultTestnetConfig({
+  contractId: process.env.SOROBAN_CONTRACT_ID!,
+  sourceKeypair,
+});
+const service = createSorobanService(config);
+
+await service.sorobanRecordBallot("hash123");
+```
+
+### Config helpers
+
+```ts
+// Testnet — defaults to https://soroban-testnet.stellar.org
+const testnetConfig = createDefaultTestnetConfig({ contractId, sourceKeypair });
+
+// Mainnet — defaults to https://soroban-mainnet.stellar.org
+const mainnetConfig = createDefaultMainnetConfig({ contractId, sourceKeypair });
+
+// Override any field for custom RPC gateways or local dev nodes:
+const customConfig = { ...testnetConfig, rpcUrl: "http://localhost:8000" };
+```
+
+### Module-level API (low-level)
+
+The module-level functions are still exported for callers who need to pass config dynamically:
+
+```ts
+import { SorobanServiceError, sorobanRecordBallot } from "@anonvote/contracts/service";
+
+try {
+  await sorobanRecordBallot(config, ballotIdHash);
+} catch (err) {
+  if (err instanceof SorobanServiceError) {
+    if (err.retryable) {
+      // Enqueue for retry with backoff
+    }
+  }
+  throw err;
+}
+```
+
+### Error handling
+
+All service helpers throw `SorobanServiceError` on failure. Import it from `service/index.ts` and wrap every call:
+
+```ts
+import { SorobanServiceError } from "@anonvote/contracts/service";
+
+try {
+  await service.sorobanRecordBallot(ballotIdHash);
+} catch (err) {
+  if (err instanceof SorobanServiceError) {
+    if (err.retryable) {
+      // Enqueue for retry with backoff — NETWORK_ERROR and SIMULATION_FAILED
+      // are transient; retrying is safe and expected.
+    } else {
+      // CONTRACT_ERROR or TRANSACTION_FAILED — do not retry.
+      // CONTRACT_ERROR indicates a logic error (e.g. ballot already exists).
+    }
+  }
+  throw err;
+}
+```
+
+Error code retryability:
+
+| `SorobanServiceErrorCode` | `retryable` | When thrown                                   |
+| -------------------------- | ----------- | --------------------------------------------- |
+| `NETWORK_ERROR`            | `true`      | RPC endpoint unreachable, DNS failure, TCP reset |
+| `SIMULATION_FAILED`        | `true`      | RPC timeout, overloaded node, no error code   |
+| `TRANSACTION_FAILED`       | `false`     | `sendTransaction` returned ERROR, or tx never confirmed after max retries |
+| `CONTRACT_ERROR`           | `false`     | On-chain logic error (BallotNotFound, BallotAlreadyExists, etc.) |
+
+Full error details (raw RPC responses, contract diagnostics) are logged internally only and are never exposed in the thrown error message, so it is safe to surface `err.message` in structured logs. Do not include raw contract error details in API responses to clients.
 
 ---
 
