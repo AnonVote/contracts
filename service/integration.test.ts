@@ -19,6 +19,11 @@ import {
   sorobanVerifyResultProof,
   sorobanRotateAdmin,
   sorobanGetRotationHistory,
+  sorobanGetBallotMetadata,
+  sorobanGetBallotStats,
+  sorobanGetAllBallots,
+  sorobanBallotIsActive,
+  sorobanIsBallotFinalized,
   SorobanErrorCode,
   SorobanServiceError,
   SorobanServiceErrorCode,
@@ -92,6 +97,64 @@ describe("AnonVote ballot lifecycle (mocked contract, no live network)", () => {
 
     const resultResult = await sorobanRecordResult(config, ballotIdHash, "result-hash-aaa");
     expect(resultResult.success).toBe(true);
+  });
+
+  it("view functions return accurate data throughout the ballot lifecycle", async () => {
+    const config = makeConfig();
+    const ballotIdHash = "ballot-view-001";
+
+    const meta0 = await sorobanGetBallotMetadata(config, ballotIdHash);
+    // Contract returns default values for non-existent ballots
+    expect(meta0).not.toBeNull();
+    expect(meta0!.created_at).toBe(0);
+    expect(meta0!.is_active).toBe(false);
+
+    const stats0 = await sorobanGetBallotStats(config, ballotIdHash);
+    expect(stats0).not.toBeNull();
+    expect(stats0!.tokens_issued).toBe(0);
+    expect(stats0!.votes_cast).toBe(0);
+    expect(stats0!.result_hash).toBeNull();
+
+    await sorobanRecordBallot(config, ballotIdHash);
+
+    const meta1 = await sorobanGetBallotMetadata(config, ballotIdHash);
+    expect(meta1).not.toBeNull();
+    expect(meta1!.admin).toBe(StellarSdk.Keypair.fromSecret(ADMIN_SECRET_KEY).publicKey());
+    expect(meta1!.created_at).toBeGreaterThan(0);
+    expect(meta1!.is_active).toBe(true);
+
+    const active1 = await sorobanBallotIsActive(config, ballotIdHash);
+    expect(active1).toBe(true);
+
+    const finalized1 = await sorobanIsBallotFinalized(config, ballotIdHash);
+    expect(finalized1).toBe(false);
+
+    await sorobanRecordToken(config, ballotIdHash);
+    await sorobanRecordToken(config, ballotIdHash);
+    await sorobanRecordVote(config, ballotIdHash);
+
+    const stats1 = await sorobanGetBallotStats(config, ballotIdHash);
+    expect(stats1).not.toBeNull();
+    expect(stats1!.tokens_issued).toBe(2);
+    expect(stats1!.votes_cast).toBe(1);
+    expect(stats1!.result_hash).toBeNull();
+
+    await sorobanRecordResult(config, ballotIdHash, "result-view-hash");
+
+    const meta2 = await sorobanGetBallotMetadata(config, ballotIdHash);
+    expect(meta2!.is_active).toBe(false);
+
+    const active2 = await sorobanBallotIsActive(config, ballotIdHash);
+    expect(active2).toBe(false);
+
+    const finalized2 = await sorobanIsBallotFinalized(config, ballotIdHash);
+    expect(finalized2).toBe(true);
+
+    const stats2 = await sorobanGetBallotStats(config, ballotIdHash);
+    expect(stats2!.result_hash).toBe("result-view-hash");
+
+    const allBallots = await sorobanGetAllBallots(config);
+    expect(allBallots).toContain(ballotIdHash);
   });
 
   it("treats re-recording the same result hash as an idempotent success", async () => {
@@ -199,6 +262,50 @@ describe("AnonVote ballot lifecycle (mocked contract, no live network)", () => {
 
     const afterResult = await sorobanResultExists(config, ballotIdHash);
     expect(afterResult).toBe(true);
+  });
+
+  it("view functions return sensible defaults for non-existent ballots", async () => {
+    const config = makeConfig();
+    const unknownBallot = "does-not-exist";
+
+    const meta = await sorobanGetBallotMetadata(config, unknownBallot);
+    // Contract returns zero-value defaults, not an error
+    expect(meta).not.toBeNull();
+    expect(meta!.created_at).toBe(0);
+    expect(meta!.is_active).toBe(false);
+
+    const stats = await sorobanGetBallotStats(config, unknownBallot);
+    expect(stats).not.toBeNull();
+    expect(stats!.tokens_issued).toBe(0);
+    expect(stats!.votes_cast).toBe(0);
+
+    const active = await sorobanBallotIsActive(config, unknownBallot);
+    expect(active).toBe(false);
+
+    const finalized = await sorobanIsBallotFinalized(config, unknownBallot);
+    expect(finalized).toBe(false);
+
+    const allBallots = await sorobanGetAllBallots(config);
+    expect(allBallots).toEqual(expect.any(Array));
+  });
+
+  it("view functions do not mutate state", async () => {
+    const config = makeConfig();
+    const ballotIdHash = "view-no-mutate";
+
+    await sorobanRecordBallot(config, ballotIdHash);
+    await sorobanRecordToken(config, ballotIdHash);
+
+    const tokensBefore = (await sorobanGetAuditCounts(config, ballotIdHash))!.tokensIssued;
+
+    await sorobanGetBallotMetadata(config, ballotIdHash);
+    await sorobanGetBallotStats(config, ballotIdHash);
+    await sorobanGetAllBallots(config);
+    await sorobanBallotIsActive(config, ballotIdHash);
+    await sorobanIsBallotFinalized(config, ballotIdHash);
+
+    const tokensAfter = (await sorobanGetAuditCounts(config, ballotIdHash))!.tokensIssued;
+    expect(tokensAfter).toBe(tokensBefore);
   });
 
   it("sorobanGetAuditReport returns full report matching individual reads and verifies immutability", async () => {

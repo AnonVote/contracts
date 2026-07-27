@@ -231,6 +231,18 @@ export enum BallotState {
   Archived        = "Archived",
 }
 
+export interface BallotMetadata {
+  created_at: number;
+  admin: string;
+  is_active: boolean;
+}
+
+export interface BallotStats {
+  tokens_issued: number;
+  votes_cast: number;
+  result_hash: string | null;
+}
+
 export interface BallotStateSnapshot {
   tokens_issued: number;
   votes_cast: number;
@@ -1182,6 +1194,100 @@ export async function sorobanVerifyResultProof(
 }
 
 /**
+ * Get full ballot metadata (created_at, admin, is_active).
+ * Returns null if the config is invalid or the query fails.
+ */
+export async function sorobanGetBallotMetadata(
+  config: SorobanConfig,
+  ballotIdHash: string,
+): Promise<BallotMetadata | null> {
+  const contractCheck = validateContractId(config.contractId);
+  if (!contractCheck.valid) return null;
+  const { value, errorCode } = await readContract(config, "get_ballot_metadata", [
+    { value: ballotIdHash, type: "string" },
+  ]);
+  if (errorCode !== undefined) return null;
+  const raw = value as { created_at: number; admin: string; is_active: boolean } | null;
+  if (!raw) return null;
+  return {
+    created_at: Number(raw.created_at ?? 0),
+    admin: String(raw.admin ?? ""),
+    is_active: raw.is_active === true,
+  };
+}
+
+/**
+ * Get ballot statistics (tokens_issued, votes_cast, result_hash).
+ * Returns null if the config is invalid or the query fails.
+ */
+export async function sorobanGetBallotStats(
+  config: SorobanConfig,
+  ballotIdHash: string,
+): Promise<BallotStats | null> {
+  const contractCheck = validateContractId(config.contractId);
+  if (!contractCheck.valid) return null;
+  const { value, errorCode } = await readContract(config, "get_ballot_stats", [
+    { value: ballotIdHash, type: "string" },
+  ]);
+  if (errorCode !== undefined) return null;
+  const raw = value as { tokens_issued: number; votes_cast: number; result_hash: string | null } | null;
+  if (!raw) return null;
+  return {
+    tokens_issued: Number(raw.tokens_issued ?? 0),
+    votes_cast: Number(raw.votes_cast ?? 0),
+    result_hash: raw.result_hash ?? null,
+  };
+}
+
+/**
+ * Get the list of all ballot ID hashes recorded on-chain.
+ * Returns an empty array if no ballots exist or config is invalid.
+ */
+export async function sorobanGetAllBallots(
+  config: SorobanConfig,
+): Promise<string[]> {
+  const contractCheck = validateContractId(config.contractId);
+  if (!contractCheck.valid) return [];
+  const { value, errorCode } = await readContract(config, "get_all_ballots", []);
+  if (errorCode !== undefined) return [];
+  return Array.isArray(value) ? value.map(String) : [];
+}
+
+/**
+ * Quick check: returns true if the ballot exists and is active.
+ * Returns null if the config is invalid or the query fails.
+ */
+export async function sorobanBallotIsActive(
+  config: SorobanConfig,
+  ballotIdHash: string,
+): Promise<boolean | null> {
+  const contractCheck = validateContractId(config.contractId);
+  if (!contractCheck.valid) return null;
+  const { value, errorCode } = await readContract(config, "ballot_is_active", [
+    { value: ballotIdHash, type: "string" },
+  ]);
+  if (errorCode !== undefined) return null;
+  return (value as boolean) ?? false;
+}
+
+/**
+ * Check if a result has been published (ballot is finalized).
+ * Returns null if the config is invalid or the query fails.
+ */
+export async function sorobanIsBallotFinalized(
+  config: SorobanConfig,
+  ballotIdHash: string,
+): Promise<boolean | null> {
+  const contractCheck = validateContractId(config.contractId);
+  if (!contractCheck.valid) return null;
+  const { value, errorCode } = await readContract(config, "is_ballot_finalized", [
+    { value: ballotIdHash, type: "string" },
+  ]);
+  if (errorCode !== undefined) return null;
+  return (value as boolean) ?? false;
+}
+
+/**
  * Get complete ballot expiration (single read call).
  */
 export async function sorobanGetBallotExpiration(
@@ -1411,6 +1517,21 @@ export function createSorobanService(config: SorobanConfig) {
       voteMerkleProof: MerkleProof,
       resultHash: string,
     ) => sorobanVerifyResultProof(config, ballotIdHash, voteMerkleProof, resultHash),
+
+    sorobanGetBallotMetadata: (ballotIdHash: string) =>
+      sorobanGetBallotMetadata(config, ballotIdHash),
+
+    sorobanGetBallotStats: (ballotIdHash: string) =>
+      sorobanGetBallotStats(config, ballotIdHash),
+
+    sorobanGetAllBallots: () =>
+      sorobanGetAllBallots(config),
+
+    sorobanBallotIsActive: (ballotIdHash: string) =>
+      sorobanBallotIsActive(config, ballotIdHash),
+
+    sorobanIsBallotFinalized: (ballotIdHash: string) =>
+      sorobanIsBallotFinalized(config, ballotIdHash),
 
     sorobanGetBallotExpiration: (ballotIdHash: string) =>
       sorobanGetBallotExpiration(config, ballotIdHash),
