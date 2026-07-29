@@ -1,5 +1,7 @@
 # AnonVote Soroban Smart Contract
 
+[![CI](https://github.com/damiedee96/contracts/actions/workflows/ci.yml/badge.svg)](https://github.com/damiedee96/contracts/actions/workflows/ci.yml)
+
 Records immutable audit events on the Stellar blockchain with on-chain queryable state.
 
 ## What it does
