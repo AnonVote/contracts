@@ -106,6 +106,27 @@ Check the contract on Stellar Explorer:
 - Testnet: `https://stellar.expert/explorer/testnet/contract/<CONTRACT_ID>`
 - Mainnet: `https://stellar.expert/explorer/mainnet/contract/<CONTRACT_ID>`
 
+### Contract ID
+
+After a successful deployment the contract ID is recorded in two places:
+
+- **`contracts/CONTRACT_ID`** — human-readable file, one line per network, committed to git
+- **`contracts/deployments.json`** — full deployment metadata (contract ID, WASM hash, git commit, timestamp)
+
+Both files are updated automatically by `deploy.sh`. Commit them so the deployed ID is always traceable in version history.
+
+Set the contract ID in the backend before starting the server:
+
+```bash
+# contracts/.env  (used by the TypeScript service layer)
+SOROBAN_CONTRACT_ID=<CONTRACT_ID>
+
+# backend/.env  (used by the backend application)
+SOROBAN_CONTRACT_ID=<CONTRACT_ID>
+```
+
+The backend reads `SOROBAN_CONTRACT_ID` from the environment on startup and validates the format before accepting requests. If the variable is missing or malformed the server will refuse to start.
+
 ### Pushing to remote
 
 After deployment, push the tag and commit:
