@@ -5,10 +5,13 @@
 
 #![no_std]
 
+mod validation;
+
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env,
     String, Symbol, Vec,
 };
+use validation::validate_hex_hash;
 
 const APPROVAL_EXPIRATION_SECONDS: u64 = 7 * 24 * 60 * 60;
 const UPGRADE_TIME_LOCK_SECONDS: u64 = 48 * 60 * 60;
@@ -41,6 +44,7 @@ pub enum ContractError {
     SameAdmin = 22,
     InvalidBallotIdHash = 23,
     InvalidResultHash = 24,
+    InvalidAdminAddress = 25,
 }
 
 #[contracttype]
@@ -171,6 +175,7 @@ pub struct PendingOperation {
 #[derive(Clone)]
 pub enum DataKey {
     Admin,
+    Initialized,
     InitializedAt,
     IsPaused,
     Approvers,
@@ -196,12 +201,21 @@ impl AnonVoteContract {
     /// Initializes the contract. Governance starts as 1-of-1 with the admin as
     /// the sole approver, so deployments can explicitly configure M-of-N next.
     pub fn initialize(env: Env, admin: Address) -> Result<(), ContractError> {
-        if env.storage().instance().has(&DataKey::Admin) {
+        if env.storage().instance().has(&DataKey::Initialized) {
             return Err(ContractError::AlreadyInitialized);
+        }
+        if admin
+            == Address::from_string(&String::from_str(
+                &env,
+                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            ))
+        {
+            return Err(ContractError::InvalidAdminAddress);
         }
 
         let mut approvers = Vec::new(&env);
         approvers.push_back(admin.clone());
+        env.storage().instance().set(&DataKey::Initialized, &true);
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
             .instance()
@@ -567,6 +581,7 @@ impl AnonVoteContract {
         caller: Address,
         ballot_id_hash: String,
     ) -> Result<(), ContractError> {
+        validate_hex_hash(&ballot_id_hash, ContractError::InvalidBallotIdHash)?;
         caller.require_auth();
         Self::require_not_paused(&env)?;
         Self::require_admin(&env, &caller)?;
@@ -577,7 +592,13 @@ impl AnonVoteContract {
         if count >= metadata.limits.max_tokens {
             return Err(ContractError::LimitExceeded);
         }
-        let new_count = count.checked_add(1).ok_or(ContractError::CounterOverflow)?;
+        let new_count = count.checked_add(1).ok_or_else(|| {
+            env.events().publish(
+                (symbol_short!("counter"), symbol_short!("ovrflw")),
+                (ballot_id_hash.clone(), count),
+            );
+            ContractError::CounterOverflow
+        })?;
         env.storage().persistent().set(&key, &new_count);
         env.events().publish(
             (symbol_short!("audit"), symbol_short!("tok_issd")),
@@ -595,6 +616,7 @@ impl AnonVoteContract {
         caller: Address,
         ballot_id_hash: String,
     ) -> Result<(), ContractError> {
+        validate_hex_hash(&ballot_id_hash, ContractError::InvalidBallotIdHash)?;
         caller.require_auth();
         Self::require_not_paused(&env)?;
         Self::require_admin(&env, &caller)?;
@@ -605,7 +627,13 @@ impl AnonVoteContract {
         if count >= metadata.limits.max_votes {
             return Err(ContractError::LimitExceeded);
         }
-        let new_count = count.checked_add(1).ok_or(ContractError::CounterOverflow)?;
+        let new_count = count.checked_add(1).ok_or_else(|| {
+            env.events().publish(
+                (symbol_short!("counter"), symbol_short!("ovrflw")),
+                (ballot_id_hash.clone(), count),
+            );
+            ContractError::CounterOverflow
+        })?;
         env.storage().persistent().set(&key, &new_count);
         env.events().publish(
             (symbol_short!("audit"), symbol_short!("vote_cast")),
