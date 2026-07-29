@@ -149,10 +149,25 @@ mv "$TEMP_FILE" "$DEPLOYMENTS_FILE"
 echo "    Saved."
 echo ""
 
-# ---------- 6. Git tag ----------
+# ---------- 6. Update CONTRACT_ID file ----------
+CONTRACT_ID_FILE="$SCRIPT_DIR/CONTRACT_ID"
+echo ">>> Updating CONTRACT_ID file..."
+if [[ -f "$CONTRACT_ID_FILE" ]]; then
+  # Replace the line for this network (e.g. "testnet: ..." → "testnet: C...")
+  # Works on both GNU and BSD sed via a temp file
+  TEMP_ID_FILE=$(mktemp)
+  sed "s|^${NETWORK}:.*|${NETWORK}: ${CONTRACT_ID}|" "$CONTRACT_ID_FILE" > "$TEMP_ID_FILE"
+  mv "$TEMP_ID_FILE" "$CONTRACT_ID_FILE"
+  echo "    Updated ${NETWORK} entry in CONTRACT_ID."
+else
+  echo "    Warning: CONTRACT_ID file not found at $CONTRACT_ID_FILE — skipping."
+fi
+echo ""
+
+# ---------- 7. Git tag ----------
 TAG="contract-${NETWORK}-v1.0.0"
 echo ">>> Creating git tag: $TAG"
-git -C "$SCRIPT_DIR" add "$DEPLOYMENTS_FILE"
+git -C "$SCRIPT_DIR" add "$DEPLOYMENTS_FILE" "$CONTRACT_ID_FILE"
 if git -C "$SCRIPT_DIR" diff --cached --quiet; then
   echo "    No changes to commit."
 else
@@ -174,6 +189,8 @@ echo "============================================"
 echo ""
 echo "Next steps:"
 echo "  1. Verify on Stellar Explorer: https://stellar.expert/explorer/$NETWORK/contract/$CONTRACT_ID"
-echo "  2. Add to backend .env: SOROBAN_CONTRACT_ID=$CONTRACT_ID"
-echo "  3. Push tag:    git push origin $TAG"
-echo "  4. Push commit: git push origin $NETWORK"
+echo "  2. Set in contracts/.env:       SOROBAN_CONTRACT_ID=$CONTRACT_ID"
+echo "  3. Set in backend/.env:         SOROBAN_CONTRACT_ID=$CONTRACT_ID"
+echo "  4. Initialize backend:          SOROBAN_CONTRACT_ID is validated on startup"
+echo "  5. Push tag:                    git push origin $TAG"
+echo "  6. Push commit:                 git push origin HEAD"
