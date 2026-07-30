@@ -1,0 +1,11 @@
+{
+  "_comment": "Updated automatically by deploy.sh. Do not edit manually.",
+  "_schema": {
+    "contract_id": "Stellar contract address (C...)",
+    "transaction_id": "Deployment transaction hash (null until confirmed)",
+    "timestamp": "ISO 8601 UTC timestamp of deployment",
+    "wasm_hash": "SHA-256 of the deployed WASM binary",
+    "git_commit": "Short git SHA at time of deployment",
+    "rpc_url": "Soroban RPC endpoint used for deployment"
+  }
+}

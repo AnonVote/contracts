@@ -1,54 +1,23 @@
-# AnonVote Contracts
+# AnonVote Soroban Smart Contract
 
-**Soroban smart contracts for on-chain audit and verification of AnonVote ballots.**
+[![CI](https://github.com/damiedee96/contracts/actions/workflows/ci.yml/badge.svg)](https://github.com/damiedee96/contracts/actions/workflows/ci.yml)
 
-This repo contains all Stellar/Soroban contract code for the AnonVote ecosystem. Contracts provide on-chain queryable state that complements the off-chain privacy engine — giving anyone the ability to verify ballot integrity directly on the Stellar ledger without trusting AnonVote's servers.
+Records immutable audit events on the Stellar blockchain with on-chain queryable state.
 
-[![Rust](https://img.shields.io/badge/Rust-1.78+-orange)](https://www.rust-lang.org/)
-[![Soroban SDK](https://img.shields.io/badge/soroban--sdk-21.0.0-blueviolet)](https://github.com/stellar/rs-soroban-sdk)
-[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+## What it does
 
----
+| Function                                     | Description                  |
+| -------------------------------------------- | ---------------------------- |
+| `record_ballot(ballot_id_hash)`              | Register a ballot on-chain   |
+| `record_token(ballot_id_hash)`               | Increment token issued count |
+| `record_vote(ballot_id_hash)`                | Increment vote cast count    |
+| `record_result(ballot_id_hash, result_hash)` | Publish result hash          |
+| `get_tokens_issued(ballot_id_hash)`          | Read token count             |
+| `get_votes_cast(ballot_id_hash)`             | Read vote count              |
+| `get_result_hash(ballot_id_hash)`            | Read result hash             |
+| `is_consistent(ballot_id_hash)`              | Check tokens == votes        |
 
-## Role in the ecosystem
-
-| Repo                                                      | Relationship                                                    |
-| --------------------------------------------------------- | --------------------------------------------------------------- |
-| [AnonVote/core](https://github.com/AnonVote/core)         | Backend calls `sorobanService.ts` which invokes these contracts |
-| [AnonVote/js](https://github.com/AnonVote/js)             | No dependency — contracts are Rust, not JS                      |
-| [AnonVote/protocol](https://github.com/AnonVote/protocol) | Whitepaper references contract audit model                      |
-
----
-
-## What's in this repo
-
-### `contracts/anonvote/` — AnonVote Audit Contract
-
-The primary Soroban contract. Records immutable audit events on-chain with public read access.
-
-| Function                                     | Description                                                          |
-| -------------------------------------------- | -------------------------------------------------------------------- |
-| `initialize(admin)`                          | One-time setup after deployment. Sets the admin address.             |
-| `record_ballot(ballot_id_hash)`              | Register a ballot on-chain. Input is SHA-256 hex of the ballot UUID. |
-| `record_token(ballot_id_hash)`               | Increment the token-issued count for a ballot.                       |
-| `record_vote(ballot_id_hash)`                | Increment the vote-cast count for a ballot.                          |
-| `record_result(ballot_id_hash, result_hash)` | Publish the result hash (SHA-256 of tally JSON). Immutable once set. |
-| `get_tokens_issued(ballot_id_hash)`          | Read token count (view call).                                        |
-| `get_votes_cast(ballot_id_hash)`             | Read vote count (view call).                                         |
-| `get_result_hash(ballot_id_hash)`            | Read result hash (view call).                                        |
-| `ballot_exists(ballot_id_hash)`              | Check if a ballot has been recorded on-chain.                        |
-| `is_consistent(ballot_id_hash)`              | Returns `true` if `tokens_issued == votes_cast`.                     |
-
-**Privacy guarantees:**
-
-- No voter identifiers stored
-- No token values stored
-- No vote content stored
-- Only counts and hashes — same privacy model as the off-chain system
-
-### `service/sorobanService.ts` — TypeScript Service Stub
-
-A fully-typed TypeScript wrapper around the Soroban contract, ready to wire into [AnonVote/core](https://github.com/AnonVote/core). Uses `stellar-sdk` v12 with correct RPC, simulation, and assembly APIs.
+All inputs use SHA-256 hashes of ballot UUIDs — no raw IDs stored on-chain.
 
 ---
 
@@ -85,70 +54,218 @@ cd contracts/anonvote
 cargo test
 ```
 
-All tests run in the Soroban native test environment — no network required.
-
 ---
 
-## Deploy to Testnet
+## Deploy
+
+### Prerequisites
+
+- [Rust](https://rustup.rs/) with the `wasm32-unknown-unknown` target
+- [Stellar CLI](https://github.com/stellar/stellar-cli)
+- `jq` installed
+- A Stellar account funded with testnet/mainnet XLM
+
+### Environment variables
+
+Copy `.env.example` to `.env` and fill in:
 
 ```bash
-# Deploy the contract WASM
-stellar contract deploy \
-  --wasm contracts/anonvote/target/wasm32-unknown-unknown/release/anonvote.wasm \
-  --source <YOUR_SECRET_KEY> \
-  --network testnet
-
-# Output: CONTRACT_ID (e.g. CABC123...)
-
-# Initialize with your admin public key
-stellar contract invoke \
-  --id <CONTRACT_ID> \
-  --source <YOUR_SECRET_KEY> \
-  --network testnet \
-  -- initialize \
-  --admin <YOUR_PUBLIC_KEY>
+cp .env.example .env
 ```
 
-Then add to `core`'s `backend/.env`:
+| Variable | Required | Description |
+|---|---|---|---|
+| `STELLAR_SECRET_KEY` | Yes | Admin secret key for signing the deploy transaction |
+| `SOROBAN_RPC_URL_TESTNET` | No | Testnet RPC endpoint — defaults to `https://soroban-testnet.stellar.org` |
+| `SOROBAN_RPC_URL_MAINNET` | No | Mainnet RPC endpoint — defaults to `https://soroban-mainnet.stellar.org` |
 
-```env
+### Deploy to testnet
+
+```bash
+source .env
+./deploy.sh testnet
+```
+
+### Deploy to mainnet
+
+```bash
+source .env
+./deploy.sh mainnet
+```
+
+### What the script does
+
+1. Builds the WASM binary
+2. Deploys to the specified Stellar network
+3. Initializes the contract with the derived admin address
+4. Records contract ID, WASM hash, git commit, and timestamp in `deployments.json`
+5. Creates a git tag (`contract-testnet-v1.0.0` or `contract-mainnet-v1.0.0`)
+6. Prints a summary with the contract ID and verification links
+
+### Verifying deployment
+
+Check the contract on Stellar Explorer:
+- Testnet: `https://stellar.expert/explorer/testnet/contract/<CONTRACT_ID>`
+- Mainnet: `https://stellar.expert/explorer/mainnet/contract/<CONTRACT_ID>`
+
+### Contract ID
+
+After a successful deployment the contract ID is recorded in two places:
+
+- **`contracts/CONTRACT_ID`** — human-readable file, one line per network, committed to git
+- **`contracts/deployments.json`** — full deployment metadata (contract ID, WASM hash, git commit, timestamp)
+
+Both files are updated automatically by `deploy.sh`. Commit them so the deployed ID is always traceable in version history.
+
+Set the contract ID in the backend before starting the server:
+
+```bash
+# contracts/.env  (used by the TypeScript service layer)
+SOROBAN_CONTRACT_ID=<CONTRACT_ID>
+
+# backend/.env  (used by the backend application)
 SOROBAN_CONTRACT_ID=<CONTRACT_ID>
 ```
 
----
+The backend reads `SOROBAN_CONTRACT_ID` from the environment on startup and validates the format before accepting requests. If the variable is missing or malformed the server will refuse to start.
 
-## Wiring into core
+### Pushing to remote
 
-Once deployed, the `sorobanService.ts` helpers are called from these locations in [AnonVote/core](https://github.com/AnonVote/core):
+After deployment, push the tag and commit:
 
-| Core file                     | Contract call                                   |
-| ----------------------------- | ----------------------------------------------- |
-| `services/ballotEngine.ts`    | `sorobanRecordBallot(ballotIdHash)`             |
-| `services/identityManager.ts` | `sorobanRecordToken(ballotIdHash)`              |
-| `services/privacyEngine.ts`   | `sorobanRecordVote(ballotIdHash)`               |
-| `services/resultEngine.ts`    | `sorobanRecordResult(ballotIdHash, resultHash)` |
-
-The `ballot_id_hash` argument is `hashIdentifier(ballotId)` from `@anonvote/crypto`.
-
----
-
-## Repository structure
-
-```
-contracts/
-├── contracts/
-│   └── anonvote/
-│       ├── src/
-│       │   └── lib.rs       # Soroban contract implementation
-│       ├── Cargo.toml
-│       └── README.md
-├── service/
-│   └── sorobanService.ts    # TypeScript service stub for core
-└── README.md
+```bash
+git push origin contract-testnet-v1.0.0
+git push origin feat/contract-deployment-script
 ```
 
 ---
 
-## License
+## Wire into the backend
 
-[MIT](LICENSE)
+Once deployed, update `backend/src/services/sorobanService.ts` calls in:
+
+- `backend/src/services/ballotEngine.ts` — call `invokeContract(id, "record_ballot", [...])`
+- `backend/src/services/identityManager.ts` — call `invokeContract(id, "record_token", [...])`
+- `backend/src/services/privacyEngine.ts` — call `invokeContract(id, "record_vote", [...])`
+- `backend/src/services/resultEngine.ts` — call `invokeContract(id, "record_result", [...])`
+
+The `ballot_id_hash` argument should be `hashIdentifier(ballotId)` — the same SHA-256 function already used in the backend.
+
+## Usage
+
+### Factory API (recommended)
+
+The preferred way to use the service is via the `createSorobanService` factory, which creates an object with all methods pre-bound to a config:
+
+```ts
+import { Keypair } from "stellar-sdk";
+import { createSorobanService, createDefaultTestnetConfig } from "@anonvote/contracts/service";
+
+const sourceKeypair = Keypair.fromSecret(process.env.STELLAR_SECRET_KEY!);
+const config = createDefaultTestnetConfig({
+  contractId: process.env.SOROBAN_CONTRACT_ID!,
+  sourceKeypair,
+});
+const service = createSorobanService(config);
+
+await service.sorobanRecordBallot("hash123");
+```
+
+### Config helpers
+
+```ts
+// Testnet — defaults to https://soroban-testnet.stellar.org
+const testnetConfig = createDefaultTestnetConfig({ contractId, sourceKeypair });
+
+// Mainnet — defaults to https://soroban-mainnet.stellar.org
+const mainnetConfig = createDefaultMainnetConfig({ contractId, sourceKeypair });
+
+// Override any field for custom RPC gateways or local dev nodes:
+const customConfig = { ...testnetConfig, rpcUrl: "http://localhost:8000" };
+```
+
+### Module-level API (low-level)
+
+The module-level functions are still exported for callers who need to pass config dynamically:
+
+```ts
+import { SorobanServiceError, sorobanRecordBallot } from "@anonvote/contracts/service";
+
+try {
+  await sorobanRecordBallot(config, ballotIdHash);
+} catch (err) {
+  if (err instanceof SorobanServiceError) {
+    if (err.retryable) {
+      // Enqueue for retry with backoff
+    }
+  }
+  throw err;
+}
+```
+
+### Error handling
+
+All service helpers throw `SorobanServiceError` on failure. Import it from `service/index.ts` and wrap every call:
+
+```ts
+import { SorobanServiceError } from "@anonvote/contracts/service";
+
+try {
+  await service.sorobanRecordBallot(ballotIdHash);
+} catch (err) {
+  if (err instanceof SorobanServiceError) {
+    if (err.retryable) {
+      // Enqueue for retry with backoff — NETWORK_ERROR and SIMULATION_FAILED
+      // are transient; retrying is safe and expected.
+    } else {
+      // CONTRACT_ERROR or TRANSACTION_FAILED — do not retry.
+      // CONTRACT_ERROR indicates a logic error (e.g. ballot already exists).
+    }
+  }
+  throw err;
+}
+```
+
+Error code retryability:
+
+| `SorobanServiceErrorCode` | `retryable` | When thrown                                   |
+| -------------------------- | ----------- | --------------------------------------------- |
+| `NETWORK_ERROR`            | `true`      | RPC endpoint unreachable, DNS failure, TCP reset |
+| `SIMULATION_FAILED`        | `true`      | RPC timeout, overloaded node, no error code   |
+| `TRANSACTION_FAILED`       | `false`     | `sendTransaction` returned ERROR, or tx never confirmed after max retries |
+| `CONTRACT_ERROR`           | `false`     | On-chain logic error (BallotNotFound, BallotAlreadyExists, etc.) |
+
+Full error details (raw RPC responses, contract diagnostics) are logged internally only and are never exposed in the thrown error message, so it is safe to surface `err.message` in structured logs. Do not include raw contract error details in API responses to clients.
+
+---
+
+## Milestones
+
+AnonVote development is organized into three milestones. Each issue is tagged with which milestone it belongs to.
+
+### Milestone 1 — Foundation
+
+Everything works end-to-end on testnet. A real admin can create a ballot, upload voters, issue tokens, collect votes, tally, and verify the result on Stellar. No manual database steps.
+
+**Status:** In progress
+**Focus:** Core voting flow, Soroban integration, vote encryption, public verification
+
+### Milestone 2 — Hardening
+
+The system is production-safe. Per-ballot encryption keys, rate limiting, error handling, retry queues, no raw identifiers anywhere, Soroban fully wired not stubbed.
+
+**Status:** Planned
+**Focus:** Security hardening, production readiness, reliability, scalability
+
+### Milestone 3 — Ecosystem
+
+@anonvote/crypto published on npm, docs repo complete, contracts deployed on mainnet, third party developers can build on top of AnonVote using the JS SDK.
+
+**Status:** Planned
+**Focus:** SDK release, third-party integrations, documentation
+
+---
+
+## Contributing
+
+Issues are labeled with their corresponding milestone so you can see what stage of development they belong to.
