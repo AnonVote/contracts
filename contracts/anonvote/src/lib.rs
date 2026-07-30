@@ -196,7 +196,7 @@ impl AnonVoteContract {
     /// Initializes the contract. Governance starts as 1-of-1 with the admin as
     /// the sole approver, so deployments can explicitly configure M-of-N next.
     pub fn initialize(env: Env, admin: Address) -> Result<(), ContractError> {
-        if env.storage().instance().has(&DataKey::Admin) {
+        if env.storage().instance().has(&DataKey::Initialized) {
             return Err(ContractError::AlreadyInitialized);
         }
 
@@ -567,6 +567,7 @@ impl AnonVoteContract {
         caller: Address,
         ballot_id_hash: String,
     ) -> Result<(), ContractError> {
+        validate_hex_hash(&env, &ballot_id_hash, ContractError::InvalidBallotIdHash)?;
         caller.require_auth();
         Self::require_not_paused(&env)?;
         Self::require_admin(&env, &caller)?;
@@ -595,6 +596,7 @@ impl AnonVoteContract {
         caller: Address,
         ballot_id_hash: String,
     ) -> Result<(), ContractError> {
+        validate_hex_hash(&env, &ballot_id_hash, ContractError::InvalidBallotIdHash)?;
         caller.require_auth();
         Self::require_not_paused(&env)?;
         Self::require_admin(&env, &caller)?;
@@ -623,6 +625,7 @@ impl AnonVoteContract {
         caller: Address,
         ballot_id_hash: String,
     ) -> Result<(), ContractError> {
+        validate_hex_hash(&env, &result_hash, ContractError::InvalidResultHash)?;
         caller.require_auth();
         Self::require_admin(&env, &caller)?;
         Self::require_ballot_metadata(&env, &ballot_id_hash)?;
@@ -1104,9 +1107,9 @@ impl AnonVoteContract {
             .storage()
             .instance()
             .get(&DataKey::Admin)
-            .ok_or(ContractError::NotInitialized)?;
+            .ok_or(ContractError::Unauthorized)?;
         if *caller != admin {
-            return Err(ContractError::AdminUnauthorized);
+            return Err(ContractError::Unauthorized);
         }
         Ok(())
     }
@@ -1950,3 +1953,6 @@ mod tests {
         assert!(!client.is_consistent(&phantom));
     }
 }
+
+#[cfg(test)]
+mod test;
